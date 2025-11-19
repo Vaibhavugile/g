@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "308303504367",
+    "project_id": "calling-a6e56",
+    "storage_bucket": "calling-a6e56.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:308303504367:android:d19c97f2e0b0a746a20c1a",
+        "android_client_info": {
+          "package_name": "com.example.call_leads_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC99P6NfSsBVU4XqmMEjK4qvJk0fzI9qQ0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
