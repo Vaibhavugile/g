@@ -14,6 +14,9 @@ import org.json.JSONObject
  *  - Prevents crashes on null/unsupported values.
  *  - Thread-safe (single lock).
  *  - Maintains strict insertion order.
+ *
+ * Additional helpers added:
+ *  - removeOldEntriesOlderThan: allow garbage-collection of stale head items (by receivedAt).
  */
 class EventQueue(private val ctx: Context) {
 
@@ -138,6 +141,51 @@ class EventQueue(private val ctx: Context) {
     fun size(): Int {
         synchronized(lock) {
             return loadArray().length()
+        }
+    }
+
+    /**
+     * Remove entries at the head of the queue that are older than `olderThanMs` according to their
+     * `receivedAt` field. This helps garbage-collect head items that would otherwise block the queue
+     * if they are permanently unresolvable.
+     *
+     * Returns the number of removed entries.
+     */
+    fun removeOldEntriesOlderThan(olderThanMs: Long): Int {
+        synchronized(lock) {
+            val arr = loadArray()
+            val now = System.currentTimeMillis()
+            var removed = 0
+            val newArr = JSONArray()
+
+            for (i in 0 until arr.length()) {
+                val jo = arr.optJSONObject(i)
+                if (jo == null) continue
+                val received = try {
+                    // prefer numeric value; tolerate string
+                    val v = jo.opt("receivedAt")
+                    when (v) {
+                        is Number -> v.toLong()
+                        is String -> v.toLongOrNull() ?: now
+                        else -> now
+                    }
+                } catch (e: Exception) {
+                    now
+                }
+
+                if (i == removed && now - received > olderThanMs) {
+                    // only remove contiguous head entries: stop removing once we hit a non-old item
+                    removed++
+                    continue
+                }
+                newArr.put(jo)
+            }
+
+            if (removed > 0) {
+                saveArray(newArr)
+                Log.w(TAG, "Removed $removed stale queued entries older than ${olderThanMs}ms to avoid blocking.")
+            }
+            return removed
         }
     }
 }

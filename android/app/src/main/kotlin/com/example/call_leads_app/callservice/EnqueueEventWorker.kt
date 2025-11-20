@@ -30,14 +30,27 @@ class EnqueueEventWorker(appContext: Context, workerParams: WorkerParameters) : 
             if ((eventMap["phoneNumber"] == null || (eventMap["phoneNumber"] as? String).isNullOrEmpty())) {
                 val callId = eventMap["callId"] as? String
                 if (!callId.isNullOrEmpty()) {
-                    val recovered = tryFindPhoneForCallId(applicationContext, callId)
+                    // brief retry loop: sometimes the marker is persisted a few ms after the event
+                    var recovered: String? = null
+                    var attempt = 0
+                    while (attempt < 4 && recovered.isNullOrEmpty()) {
+                        recovered = tryFindPhoneForCallId(applicationContext, callId)
+                        if (!recovered.isNullOrEmpty()) break
+                        try {
+                            Thread.sleep(100)
+                        } catch (ie: InterruptedException) {
+                            // ignore
+                        }
+                        attempt++
+                    }
+
                     if (!recovered.isNullOrEmpty()) {
                         // ensure we store digits-only phone
                         val recoveredNorm = recovered.filter { it.isDigit() }
                         eventMap["phoneNumber"] = if (recoveredNorm.isNotEmpty()) recoveredNorm else recovered
-                        Log.d(TAG, "Recovered phoneNumber=$recovered for callId=$callId")
+                        Log.d(TAG, "Recovered phoneNumber=$recovered for callId=$callId (attempts=${attempt + 1})")
                     } else {
-                        Log.w(TAG, "No phone mapping found for callId=$callId; will enqueue without phone (UploadWorker may skip).")
+                        Log.w(TAG, "No phone mapping found for callId=$callId after retries; will enqueue without phone (UploadWorker may skip).")
                     }
                 }
             }
@@ -65,6 +78,9 @@ class EnqueueEventWorker(appContext: Context, workerParams: WorkerParameters) : 
     /**
      * Fast lookup: check direct reverse mapping "callid_to_phone_<callId>" first.
      * Fallback: scan legacy "callid_<phone>" keys to find a matching callId.
+     *
+     * This version is defensive and tolerates small races by checking direct mapping first
+     * and also scanning legacy keys.
      */
     private fun tryFindPhoneForCallId(ctx: Context, callId: String): String? {
         try {

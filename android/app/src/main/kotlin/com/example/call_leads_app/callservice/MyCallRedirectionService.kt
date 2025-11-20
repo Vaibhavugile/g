@@ -23,41 +23,32 @@ class MyCallRedirectionService : CallRedirectionService() {
             Log.d(TAG, "onPlaceCall: $phoneNumber")
 
             val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+
+            // normalize first
+            val normalized = normalizeNumber(phoneNumber) ?: phoneNumber
+
+            // save outgoing marker
             prefs.edit()
-                .putString(KEY_LAST_OUTGOING, phoneNumber)
+                .putString(KEY_LAST_OUTGOING, normalized)
                 .putLong(KEY_LAST_OUTGOING_TS, System.currentTimeMillis())
                 .apply()
-            Log.d(TAG, "Saved outgoing marker for $phoneNumber")
+            Log.d(TAG, "Saved outgoing marker for $normalized")
 
-            // normalize digits-only for marker storage and callId mapping
-            val normalized = phoneNumber?.filter { it.isDigit() } ?: phoneNumber
-            val callId = generateCallId()
+            // lookup-first: reuse callId if exists
+            val existing = prefs.getString("callid_$normalized", null)
+            val callId = existing ?: ensureCallIdForPhone(normalized, prefs)
 
-            // persist callId marker for later retrieval by CallService or IncomingReceiver
-            try {
-                if (!normalized.isNullOrEmpty()) {
-                    prefs.edit()
-                        .putString("callid_$normalized", callId)
-                        .putLong("callid_ts_$normalized", System.currentTimeMillis())
-                        .putString("callid_to_phone_$callId", normalized) // <-- reverse mapping
-                        .apply()
-                    Log.d(TAG, "Saved callId marker for $normalized -> $callId (and reverse mapping)")
-                } else {
-                    // still save reverse mapping keyed by raw phone if normalized empty
-                    prefs.edit()
-                        .putString("callid_to_phone_$callId", phoneNumber)
-                        .apply()
-                    Log.d(TAG, "Saved reverse mapping for callId=$callId -> rawPhone=$phoneNumber")
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed saving callId marker: ${e.localizedMessage}")
+            if (existing != null) {
+                Log.d(TAG, "Reused existing callId for $normalized -> $existing")
+            } else {
+                Log.d(TAG, "Saved callId marker for $normalized -> $callId (and reverse mapping)")
             }
 
             val intent = Intent().apply {
                 setClassName(packageName, CALL_SERVICE_CLASS_NAME)
                 putExtra("event", "outgoing_start")
                 putExtra("direction", "outbound")
-                putExtra("phoneNumber", normalized ?: phoneNumber)
+                putExtra("phoneNumber", normalized)
                 putExtra("callId", callId)
                 putExtra("receivedAt", System.currentTimeMillis())
             }
@@ -70,6 +61,31 @@ class MyCallRedirectionService : CallRedirectionService() {
             Log.e(TAG, "Error in onPlaceCall: ${e.localizedMessage}", e)
             cancelCall()
         }
+    }
+
+    private fun normalizeNumber(n: String?): String? {
+        if (n == null) return null
+        val digits = n.filter { it.isDigit() }
+        return if (digits.isEmpty()) null else digits
+    }
+
+    private fun ensureCallIdForPhone(phoneDigitsOrRaw: String?, prefs: android.content.SharedPreferences): String {
+        try {
+            val normalized = normalizeNumber(phoneDigitsOrRaw) ?: phoneDigitsOrRaw ?: return generateCallId()
+            val existing = prefs.getString("callid_$normalized", null)
+            if (!existing.isNullOrEmpty()) return existing
+
+            val newId = generateCallId()
+            prefs.edit()
+                .putString("callid_$normalized", newId)
+                .putLong("callid_ts_$normalized", System.currentTimeMillis())
+                .putString("callid_to_phone_$newId", normalized)
+                .apply()
+            return newId
+        } catch (e: Exception) {
+            Log.w(TAG, "ensureCallIdForPhone failed: ${e.localizedMessage}")
+        }
+        return generateCallId()
     }
 
     private fun generateCallId(): String {

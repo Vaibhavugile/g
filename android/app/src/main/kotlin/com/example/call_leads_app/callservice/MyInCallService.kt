@@ -37,30 +37,17 @@ class MyInCallService : InCallService() {
         try {
             val handle = call.details?.handle
             val phone = handle?.schemeSpecificPart
-            val normalized = phone?.filter { it.isDigit() } ?: phone
+            val normalized = normalizeNumber(phone) ?: phone
 
-            val callId = generateCallId()
-            // persist marker and reverse mapping
-            if (!normalized.isNullOrEmpty()) {
-                try {
-                    val prefs = applicationContext.getSharedPreferences("call_leads_prefs", Context.MODE_PRIVATE)
-                    prefs.edit()
-                        .putString("callid_$normalized", callId)
-                        .putLong("callid_ts_$normalized", System.currentTimeMillis())
-                        .putString("callid_to_phone_$callId", normalized)
-                        .apply()
-                    Log.d(TAG, "Persisted callId marker from InCallService for $normalized -> $callId")
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to persist callId marker from InCallService: ${e.localizedMessage}")
-                }
+            // Try to reuse existing mapping, otherwise create one
+            val prefs = applicationContext.getSharedPreferences("call_leads_prefs", Context.MODE_PRIVATE)
+            val existing = normalized?.let { prefs.getString("callid_$it", null) }
+            val callId = existing ?: ensureCallIdForPhone(normalized ?: phone, prefs)
+
+            if (existing != null) {
+                Log.d(TAG, "Reusing existing callId marker from InCallService for ${normalized ?: phone} -> $existing")
             } else {
-                try {
-                    val prefs = applicationContext.getSharedPreferences("call_leads_prefs", Context.MODE_PRIVATE)
-                    prefs.edit().putString("callid_to_phone_$callId", phone).apply()
-                    Log.d(TAG, "Persisted reverse mapping from InCallService for callId=$callId -> rawPhone=$phone")
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to persist reverse mapping from InCallService: ${e.localizedMessage}")
-                }
+                Log.d(TAG, "Persisted callId marker from InCallService for ${normalized ?: phone} -> $callId")
             }
 
             val intent = Intent(applicationContext, CallService::class.java).apply {
@@ -95,10 +82,17 @@ class MyInCallService : InCallService() {
         try {
             val handle = call.details?.handle
             val phone = handle?.schemeSpecificPart
-            val normalized = phone?.filter { it.isDigit() } ?: phone
+            val normalized = normalizeNumber(phone) ?: phone
 
             val prefs = applicationContext.getSharedPreferences("call_leads_prefs", Context.MODE_PRIVATE)
-            val callId = if (!normalized.isNullOrEmpty()) prefs.getString("callid_$normalized", null) else null
+            val existing = if (!normalized.isNullOrEmpty()) prefs.getString("callid_$normalized", null) else null
+            val callId = existing ?: ensureCallIdForPhone(normalized ?: phone, prefs)
+
+            if (existing != null) {
+                Log.d(TAG, "Reusing existing callId marker on callRemoved for ${normalized ?: phone} -> $existing")
+            } else {
+                Log.d(TAG, "Created callId marker on callRemoved for ${normalized ?: phone} -> $callId")
+            }
 
             // ensure reverse mapping exists for callId
             if (!callId.isNullOrEmpty() && !normalized.isNullOrEmpty()) {
@@ -128,5 +122,32 @@ class MyInCallService : InCallService() {
 
     private fun generateCallId(): String {
         return "call_" + UUID.randomUUID().toString().replace("-", "").take(12)
+    }
+
+    private fun normalizeNumber(n: String?): String? {
+        if (n == null) return null
+        val digits = n.filter { it.isDigit() }
+        return if (digits.isEmpty()) null else digits
+    }
+
+    private fun ensureCallIdForPhone(phoneDigitsOrRaw: String?, prefs: android.content.SharedPreferences): String {
+        try {
+            val normalized = normalizeNumber(phoneDigitsOrRaw) ?: phoneDigitsOrRaw
+            if (normalized.isNullOrEmpty()) return generateCallId()
+            val existing = prefs.getString("callid_$normalized", null)
+            if (!existing.isNullOrEmpty()) return existing
+
+            val newId = generateCallId()
+            prefs.edit()
+                .putString("callid_$normalized", newId)
+                .putLong("callid_ts_$normalized", System.currentTimeMillis())
+                .putString("callid_to_phone_$newId", normalized)
+                .apply()
+            return newId
+        } catch (e: Exception) {
+            Log.w(TAG, "ensureCallIdForPhone failed: ${e.localizedMessage}")
+        }
+        // fallback
+        return generateCallId()
     }
 }

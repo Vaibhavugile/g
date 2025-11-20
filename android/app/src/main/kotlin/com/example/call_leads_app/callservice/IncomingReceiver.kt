@@ -51,17 +51,11 @@ class IncomingReceiver : BroadcastReceiver() {
                     Log.d(TAG, "ℹ️ Detected recent outgoing marker for $normalizedIncoming — treating as outbound and clearing marker.")
                     prefs.edit().remove(KEY_LAST_OUTGOING).remove(KEY_LAST_OUTGOING_TS).apply()
 
-                    val callId = generateCallId()
-                    // persist both forward and reverse mappings
-                    try {
-                        prefs.edit()
-                            .putString("callid_$normalizedIncoming", callId)
-                            .putLong("callid_ts_$normalizedIncoming", System.currentTimeMillis())
-                            .putString("callid_to_phone_$callId", normalizedIncoming)
-                            .apply()
-                        Log.d(TAG, "Saved callId marker for $normalizedIncoming -> $callId")
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Failed saving callId marker: ${e.localizedMessage}")
+                    // Try to reuse existing callId if present, otherwise create & persist
+                    val existingCallId = readCallIdMarker(context, normalizedIncoming)
+                    val callId = existingCallId ?: ensureCallIdForPhone(normalizedIncoming, prefs)
+                    if (existingCallId != null) {
+                        Log.d(TAG, "Reusing existing callId for $normalizedIncoming -> $existingCallId (recent outgoing)")
                     }
 
                     val outIntent = Intent(context, CallService::class.java).apply {
@@ -80,17 +74,10 @@ class IncomingReceiver : BroadcastReceiver() {
                 TelephonyManager.EXTRA_STATE_RINGING -> {
                     Log.d(TAG, "RINGING — new incoming call: $incomingNumber")
                     if (!normalizedIncoming.isNullOrEmpty()) {
-                        val callId = generateCallId()
-                        try {
-                            prefs.edit()
-                                .putString("callid_$normalizedIncoming", callId)
-                                .putLong("callid_ts_$normalizedIncoming", System.currentTimeMillis())
-                                .putString("callid_to_phone_$callId", normalizedIncoming)
-                                .apply()
-                            Log.d(TAG, "Saved callId marker for $normalizedIncoming -> $callId")
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Failed saving callId marker in RINGING: ${e.localizedMessage}")
-                        }
+                        // reuse existing callId if present
+                        val existing = readCallIdMarker(context, normalizedIncoming)
+                        val callId = existing ?: ensureCallIdForPhone(normalizedIncoming, prefs)
+                        if (existing != null) Log.d(TAG, "Reusing existing callId for RINGING: $normalizedIncoming -> $existing")
 
                         val i = Intent(context, CallService::class.java).apply {
                             putExtra("event", "ringing")
@@ -106,7 +93,12 @@ class IncomingReceiver : BroadcastReceiver() {
                 }
                 TelephonyManager.EXTRA_STATE_OFFHOOK -> {
                     Log.d(TAG, "OFFHOOK — call answered or started: $incomingNumber")
-                    val callId = normalizedIncoming?.let { readCallIdMarker(context, it) } ?: generateCallId()
+                    // prefer existing mapping; if none, create one for normalizedIncoming or raw incomingNumber
+                    val callId = normalizedIncoming?.let { readCallIdMarker(context, it) } ?: run {
+                        val cid = ensureCallIdForPhone(normalizedIncoming ?: incomingNumber, prefs)
+                        cid ?: generateCallId()
+                    }
+
                     // persist reverse mapping in case it wasn't present
                     try {
                         val markerPhone = normalizedIncoming ?: incomingNumber
@@ -128,10 +120,10 @@ class IncomingReceiver : BroadcastReceiver() {
                 }
                 TelephonyManager.EXTRA_STATE_IDLE -> {
                     Log.d(TAG, "IDLE — finalizing call for $incomingNumber")
-                    val callId = normalizedIncoming?.let { readCallIdMarker(context, it) } ?: generateCallId()
+                    val callId = normalizedIncoming?.let { readCallIdMarker(context, it) } ?: ensureCallIdForPhone(normalizedIncoming ?: incomingNumber, prefs)
                     try {
                         val markerPhone = normalizedIncoming ?: incomingNumber
-                        if (!markerPhone.isNullOrEmpty()) {
+                        if (!markerPhone.isNullOrEmpty() && !callId.isNullOrEmpty()) {
                             prefs.edit().putString("callid_to_phone_$callId", markerPhone).apply()
                         }
                     } catch (e: Exception) {
@@ -245,5 +237,26 @@ class IncomingReceiver : BroadcastReceiver() {
             Log.w(TAG, "Failed to read callId marker: ${e.localizedMessage}")
             null
         }
+    }
+
+    private fun ensureCallIdForPhone(phoneDigitsOrRaw: String?, prefs: android.content.SharedPreferences): String? {
+        try {
+            val normalized = normalizeNumber(phoneDigitsOrRaw) ?: phoneDigitsOrRaw
+            if (normalized.isNullOrEmpty()) return null
+            val existing = prefs.getString("callid_$normalized", null)
+            if (!existing.isNullOrEmpty()) return existing
+
+            val newId = generateCallId()
+            prefs.edit()
+                .putString("callid_$normalized", newId)
+                .putLong("callid_ts_$normalized", System.currentTimeMillis())
+                .putString("callid_to_phone_$newId", normalized)
+                .apply()
+            Log.d(TAG, "Saved callId marker for $normalized -> $newId (ensureCallIdForPhone)")
+            return newId
+        } catch (e: Exception) {
+            Log.w(TAG, "ensureCallIdForPhone failed: ${e.localizedMessage}")
+        }
+        return null
     }
 }

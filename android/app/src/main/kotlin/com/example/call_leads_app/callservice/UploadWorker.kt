@@ -32,7 +32,7 @@ import com.google.firebase.firestore.Query
  *       /events/{eventId}
  *
  * This variant is defensive:
- *  - Builds ops only for items that have a usable phone number.
+ *  - Builds ops only for items that have a usable phone number (tries to recover using callId).
  *  - Commits in conservative chunks (well under Firestore limits).
  *  - Removes only the contiguous prefix of queued items that were actually uploaded,
  *    preventing accidental deletion of later items when some early items were skipped.
@@ -47,6 +47,15 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
 
     override suspend fun doWork(): Result {
         try {
+            // Garbage-collect stale head entries so they don't block the queue indefinitely.
+            // Remove contiguous head items older than 60s (configurable here).
+            try {
+                val removed = queue.removeOldEntriesOlderThan(60_000L)
+                if (removed > 0) Log.w(TAG, "Removed $removed stale head items before processing to avoid blocking.")
+            } catch (e: Exception) {
+                Log.w(TAG, "removeOldEntriesOlderThan failed: ${e.localizedMessage}")
+            }
+
             // Initialize Firebase (if necessary)
             if (FirebaseApp.getApps(applicationContext).isEmpty()) {
                 try {
@@ -84,7 +93,6 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
             Log.d(TAG, "Preparing to upload ${items.size} queued events.")
 
             // Prepare UpsertOps only for items with usable phone numbers.
-            // Keep original indices so we can safely remove only a contiguous uploaded prefix.
             data class IndexedOp(
                 val originalIndex: Int,
                 val leadPath: String,
@@ -99,8 +107,21 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
 
             for ((idx, item) in items.withIndex()) {
                 try {
-                    val phoneRaw = (item["phoneNumber"] as? String) ?: ""
-                    val phone = normalizeNumber(phoneRaw)
+                    var phoneRaw = (item["phoneNumber"] as? String) ?: ""
+
+                    // If phone missing, try to recover using callId mapping (fast path)
+                    if (phoneRaw.isEmpty()) {
+                        val callId = (item["callId"] as? String)
+                        if (!callId.isNullOrEmpty()) {
+                            val recovered = tryRecoverPhoneForCallId(applicationContext, callId)
+                            if (!recovered.isNullOrEmpty()) {
+                                phoneRaw = recovered
+                                Log.d(TAG, "Recovered phone for queued item idx=$idx via callId=$callId -> $recovered")
+                            }
+                        }
+                    }
+
+                    val phone = normalizeNumber(if (phoneRaw == null) "" else phoneRaw)
                     if (phone.isEmpty()) {
                         // Skip items without usable phone, but keep them in queue for later investigation/recovery.
                         Log.w(TAG, "Skipping queued item with empty phone: $item")
@@ -108,7 +129,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                     }
 
                     val direction = (item["direction"] as? String) ?: "inbound"
-                    val outcome = (item["outcome"] as? String) ?: "unknown"
+                    val outcome = (item["outcome"] as? String) ?: (item["event"] as? String) ?: "unknown"
                     val ts = (item["timestamp"] as? Number)?.toLong() ?: System.currentTimeMillis()
                     val durNum = item["durationInSeconds"]
                     val duration = when (durNum) {
@@ -117,6 +138,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                         else -> null
                     }
                     val callIdFromEvent = (item["callId"] as? String)
+
                     // If callId missing, try to find an open call doc for this phone; else generate one
                     val leadId = leadIdFromPhone(phone)
                     val callId = if (!callIdFromEvent.isNullOrEmpty()) {
@@ -185,7 +207,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
             }
 
             // Commit ops in chunks. We'll collect the set of original indices that were uploaded successfully.
-            val CHUNK_SIZE = 300 // conservative
+            val CHUNK_SIZE = 200 // conservative
             val uploadedOriginalIndices = mutableSetOf<Int>()
             var opIdx = 0
             while (opIdx < ops.size) {
@@ -319,11 +341,11 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
             val callsRef = firestore.collection("leads").document(leadId).collection("calls")
             // Query most recent calls for this phone. (Order and limit is lightweight.)
             val qSnap = callsRef
-    .whereEqualTo("phoneNumber", phone)
-    .orderBy("createdAt", Query.Direction.DESCENDING)
-    .limit(5)
-    .get()
-    .await()
+                .whereEqualTo("phoneNumber", phone)
+                .orderBy("createdAt", Query.Direction.DESCENDING)
+                .limit(5)
+                .get()
+                .await()
 
             if (!qSnap.isEmpty) {
                 for (doc in qSnap.documents) {
@@ -342,5 +364,28 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
         val gen = generateCallId(ts)
         Log.d(TAG, "No open call found; generated callId=$gen for phone=$phone")
         return gen
+    }
+
+    /**
+     * Attempt to recover a phone number using the shared prefs mapping for callId.
+     * This is a fast synchronous lookup used as a last-ditch attempt before skipping an item.
+     */
+    private fun tryRecoverPhoneForCallId(ctx: Context, callId: String): String? {
+        try {
+            val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            // direct reverse mapping
+            val direct = prefs.getString("callid_to_phone_$callId", null)
+            if (!direct.isNullOrEmpty()) return direct
+            // legacy fallback: look for keys named callid_<phone> == callId
+            val all = prefs.all
+            for ((k, v) in all) {
+                if (k.startsWith("callid_") && v is String && v == callId) {
+                    return k.removePrefix("callid_")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "tryRecoverPhoneForCallId failed: ${e.localizedMessage}")
+        }
+        return null
     }
 }

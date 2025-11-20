@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.database.Cursor
 import android.os.Build
 import android.os.Handler
@@ -220,11 +221,35 @@ class CallService : Service() {
     }
 
     /**
+     * Ensure we have a callId for the given normalized phone. Lookup-first: reuse existing mapping
+     * if present; otherwise create and persist a new mapping.
+     */
+    private fun ensureCallIdForPhone(normalizedPhone: String?, prefs: SharedPreferences): String? {
+        try {
+            if (normalizedPhone.isNullOrEmpty()) return null
+            val existing = prefs.getString("callid_$normalizedPhone", null)
+            if (!existing.isNullOrEmpty()) return existing
+
+            val newId = generateCallId()
+            prefs.edit()
+                .putString("callid_$normalizedPhone", newId)
+                .putLong("callid_ts_$normalizedPhone", System.currentTimeMillis())
+                .putString("callid_to_phone_$newId", normalizedPhone)
+                .apply()
+            Log.d(TAG, "Saved callId marker for $normalizedPhone -> $newId (ensureCallIdForPhone)")
+            return newId
+        } catch (e: Exception) {
+            Log.w(TAG, "ensureCallIdForPhone failed: ${e.localizedMessage}")
+        }
+        return null
+    }
+
+    /**
      * Persist event to on-device queue and attempt to forward to Flutter.
      * Also schedules WorkManager UploadWorker to ensure eventual upload to Firestore.
      *
-     * Small change: if the payload doesn't include a callId, generate one and persist both
-     * callid_<phone> and callid_to_phone_<callId> for fast reverse lookup by EnqueueEventWorker.
+     * Improvement: lookup existing callId for phone before generating a new one. This reduces
+     * multiple callId creation for the same physical call when multiple components race.
      */
     private fun persistAndForwardEvent(payload: Map<String, Any?>) {
         try {
@@ -235,13 +260,30 @@ class CallService : Service() {
             val phoneRaw = (mutable["phoneNumber"] as? String)
             val normalizedPhone = normalizeNumber(phoneRaw) ?: phoneRaw
 
-            // If callId missing, generate and save mapping
+            val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+            // If callId missing, try to reuse existing mapping before generating
             var callId = mutable["callId"] as? String
             if (callId.isNullOrEmpty()) {
-                callId = generateCallId()
+                try {
+                    if (!normalizedPhone.isNullOrEmpty()) {
+                        val existing = prefs.getString("callid_$normalizedPhone", null)
+                        if (!existing.isNullOrEmpty()) {
+                            callId = existing
+                            mutable["callId"] = callId
+                            Log.d(TAG, "Reused existing callId marker for $normalizedPhone -> $callId (persistAndForwardEvent)")
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error checking existing callId marker: ${e.localizedMessage}")
+                }
+            }
+
+            if (callId.isNullOrEmpty()) {
+                // No existing mapping found — create one (or fallback to reverse mapping for raw phone)
+                callId = ensureCallIdForPhone(normalizedPhone, prefs) ?: generateCallId()
                 mutable["callId"] = callId
                 try {
-                    val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                     val markerKey = if (!normalizedPhone.isNullOrEmpty()) normalizedPhone else (phoneRaw ?: "")
                     if (markerKey.isNotEmpty()) {
                         prefs.edit()
@@ -260,7 +302,6 @@ class CallService : Service() {
             } else {
                 // If callId present, ensure reverse mapping exists
                 try {
-                    val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                     val existing = prefs.getString("callid_to_phone_$callId", null)
                     if (existing.isNullOrEmpty() && !normalizedPhone.isNullOrEmpty()) {
                         prefs.edit().putString("callid_to_phone_$callId", normalizedPhone).apply()
