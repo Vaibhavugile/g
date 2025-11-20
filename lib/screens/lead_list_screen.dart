@@ -1,4 +1,3 @@
-// lib/screens/lead_list_screen.dart
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../models/lead.dart';
@@ -86,7 +85,8 @@ class _LeadListScreenState extends State<LeadListScreen> {
     'Outgoing',
     'Answered',
     'Missed',
-    'Rejected'
+    'Rejected',
+    'Today' // NEW: today's follow-ups
   ];
 
   // Map leadId -> LatestCall (fetched from calls subcollection)
@@ -166,6 +166,30 @@ class _LeadListScreenState extends State<LeadListScreen> {
     });
   }
 
+  // Helper: is the provided DateTime 'today' local
+  bool _isSameLocalDay(DateTime a, DateTime b) {
+    final la = a.toLocal();
+    final lb = b.toLocal();
+    return la.year == lb.year && la.month == lb.month && la.day == lb.day;
+  }
+
+  // Count today's followups (based on lead.nextFollowUp if present, else ignore)
+  int get todaysFollowupCount {
+    final now = DateTime.now();
+    return _allLeads.where((lead) {
+      final nf = lead.nextFollowUp;
+      if (nf == null) return false;
+      return _isSameLocalDay(nf, now);
+    }).length;
+  }
+
+  void _showTodayFollowups() {
+    setState(() {
+      _selectedFilter = 'Today';
+      _applySearch();
+    });
+  }
+
   void _applySearch() {
     final query = _searchCtrl.text.toLowerCase();
 
@@ -177,6 +201,13 @@ class _LeadListScreenState extends State<LeadListScreen> {
     // 2. Apply call/review filter - use _latestCallByLead if available
     _filteredLeads = searchFiltered.where((l) {
       if (_selectedFilter == 'All') return true;
+
+      // NEW: Today filter
+      if (_selectedFilter == 'Today') {
+        final nf = l.nextFollowUp;
+        if (nf == null) return false;
+        return _isSameLocalDay(nf, DateTime.now());
+      }
 
       // Use the explicit needsManualReview flag
       if (_selectedFilter == 'Needs Review') {
@@ -320,6 +351,12 @@ class _LeadListScreenState extends State<LeadListScreen> {
       extraChips.add(Chip(label: Text(last.direction.toUpperCase()), visualDensity: VisualDensity.compact));
     }
 
+    // TODAY followup badge
+    final bool isFollowupToday = lead.nextFollowUp != null && _isSameLocalDay(lead.nextFollowUp!, DateTime.now());
+    if (isFollowupToday) {
+      extraChips.insert(0, Chip(label: const Text('TODAY'), backgroundColor: Colors.orange.withOpacity(0.12), labelStyle: TextStyle(color: Colors.orange.shade800)));
+    }
+
     return Card(
       elevation: needsReview ? 4 : 2, // Higher elevation for review
       margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
@@ -398,7 +435,7 @@ class _LeadListScreenState extends State<LeadListScreen> {
     return Scaffold(
       backgroundColor: _backgroundColor,
       appBar: AppBar(
-        title: const Text("Lead L"),
+        title: const Text("Lead List"),
         backgroundColor: _primaryColor, // Premium Primary Color
         foregroundColor: Colors.white,
         elevation: 0,
@@ -424,6 +461,41 @@ class _LeadListScreenState extends State<LeadListScreen> {
           ? const Center(child: CircularProgressIndicator(color: _primaryColor))
           : Column(
               children: [
+                // -------------------------
+                // TODAY FOLLOWUPS BANNER
+                // -------------------------
+                if (todaysFollowupCount > 0)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 10),
+                    child: InkWell(
+                      onTap: _showTodayFollowups,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                        decoration: BoxDecoration(
+                          color: Colors.orange.withOpacity(0.08),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: Colors.orange.withOpacity(0.25)),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(Icons.event_available, color: Colors.orange.shade800),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Text(
+                                'Today\'s follow-ups: $todaysFollowupCount — tap to view',
+                                style: TextStyle(fontWeight: FontWeight.w700, color: Colors.orange.shade900),
+                              ),
+                            ),
+                            TextButton(
+                              onPressed: _showTodayFollowups,
+                              child: const Text('VIEW'),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+
                 // -------------------------
                 // SEARCH BAR
                 // -------------------------

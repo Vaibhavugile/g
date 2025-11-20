@@ -38,6 +38,8 @@ class LatestCall {
       try {
         return DateTime.parse(v.toString());
       } catch (_) {
+        final maybeInt = int.tryParse(v.toString());
+        if (maybeInt != null) return DateTime.fromMillisecondsSinceEpoch(maybeInt);
         return null;
       }
     }
@@ -57,10 +59,18 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
 
   late Lead _lead;
 
-  // Controllers are created once and updated when lead changes
+  // Controllers
   late TextEditingController _phoneController;
   late TextEditingController _nameController;
   late TextEditingController _noteController;
+
+  // NEW controllers for editable fields
+  late TextEditingController _addressController;
+  late TextEditingController _requirementsController;
+  DateTime? _nextFollowUp;
+  DateTime? _eventDate;
+
+  bool _saving = false;
 
   final List<String> _statusOptions = [
     "new",
@@ -79,9 +89,16 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
   void initState() {
     super.initState();
     _lead = widget.lead;
+
     _phoneController = TextEditingController(text: _lead.phoneNumber);
     _nameController = TextEditingController(text: _lead.name);
     _noteController = TextEditingController();
+
+    // initialize new controllers/date fields
+    _addressController = TextEditingController(text: _lead.address ?? '');
+    _requirementsController = TextEditingController(text: _lead.requirements ?? '');
+    _nextFollowUp = _lead.nextFollowUp;
+    _eventDate = _lead.eventDate;
 
     _loadLatestCalls();
   }
@@ -89,12 +106,15 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
   @override
   void didUpdateWidget(covariant LeadDetailsScreen oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // If widget.lead changed externally, update local state + controllers
     if (widget.lead.id != oldWidget.lead.id) {
       setState(() {
         _lead = widget.lead;
         _phoneController.text = _lead.phoneNumber;
         _nameController.text = _lead.name;
+        _addressController.text = _lead.address ?? '';
+        _requirementsController.text = _lead.requirements ?? '';
+        _nextFollowUp = _lead.nextFollowUp;
+        _eventDate = _lead.eventDate;
       });
       _loadLatestCalls();
     }
@@ -105,6 +125,8 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
     _phoneController.dispose();
     _nameController.dispose();
     _noteController.dispose();
+    _addressController.dispose();
+    _requirementsController.dispose();
     super.dispose();
   }
 
@@ -121,6 +143,42 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
         "${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}";
   }
 
+  Future<void> _saveAll() async {
+    setState(() => _saving = true);
+    try {
+      final updated = _lead.copyWith(
+        name: _nameController.text.trim(),
+        // phone is read-only here (modify pattern if you want editable phone)
+        address: _addressController.text.trim().isEmpty ? null : _addressController.text.trim(),
+        requirements:
+            _requirementsController.text.trim().isEmpty ? null : _requirementsController.text.trim(),
+        nextFollowUp: _nextFollowUp,
+        eventDate: _eventDate,
+        lastUpdated: DateTime.now(),
+        lastInteraction: DateTime.now(),
+      );
+
+      final saved = await _service.saveLead(updated);
+
+      setState(() {
+        _lead = saved;
+        _nameController.text = _lead.name;
+        _phoneController.text = _lead.phoneNumber;
+        _addressController.text = _lead.address ?? '';
+        _requirementsController.text = _lead.requirements ?? '';
+        _nextFollowUp = _lead.nextFollowUp;
+        _eventDate = _lead.eventDate;
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Saved')));
+    } catch (e) {
+      // show error
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Save failed: $e')));
+    } finally {
+      setState(() => _saving = false);
+    }
+  }
+
   Future<void> _saveStatus(String newStatus) async {
     final updated = _lead.copyWith(
       status: newStatus,
@@ -128,10 +186,10 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
       lastUpdated: DateTime.now(),
     );
 
-    await _service.saveLead(updated);
+    final saved = await _service.saveLead(updated);
 
     setState(() {
-      _lead = updated;
+      _lead = saved;
       _nameController.text = _lead.name;
       _phoneController.text = _lead.phoneNumber;
     });
@@ -153,6 +211,10 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
           _lead = updatedLead;
           _nameController.text = _lead.name;
           _phoneController.text = _lead.phoneNumber;
+          _addressController.text = _lead.address ?? '';
+          _requirementsController.text = _lead.requirements ?? '';
+          _nextFollowUp = _lead.nextFollowUp;
+          _eventDate = _lead.eventDate;
         }
       });
 
@@ -230,6 +292,31 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
                   fontWeight: FontWeight.w600,
                 ),
               ),
+            ],
+            // display small summary of address/requirements/dates
+            if ((_lead.address ?? '').isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Text('Address: ${_lead.address}', style: const TextStyle(fontSize: 13)),
+            ],
+            if ((_lead.requirements ?? '').isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text('Requirements: ${_lead.requirements}', style: const TextStyle(fontSize: 13)),
+            ],
+            if (_lead.nextFollowUp != null || _lead.eventDate != null) ...[
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  if (_lead.nextFollowUp != null)
+                    Chip(
+                      label: Text('Follow: ${_formatDate(_lead.nextFollowUp!)}'),
+                    ),
+                  const SizedBox(width: 8),
+                  if (_lead.eventDate != null)
+                    Chip(
+                      label: Text('Event: ${_formatDate(_lead.eventDate!)}'),
+                    ),
+                ],
+              )
             ]
           ],
         ),
@@ -346,6 +433,50 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
     );
   }
 
+  // ------------------------------
+  // Date/time pickers helpers UI
+  // ------------------------------
+  Future<void> _pickDateTime({required bool forNextFollowUp}) async {
+    final now = DateTime.now();
+    final initial = forNextFollowUp ? (_nextFollowUp ?? now) : (_eventDate ?? now);
+    final pickedDate = await showDatePicker(
+      context: context,
+      initialDate: initial,
+      firstDate: DateTime(now.year - 5),
+      lastDate: DateTime(now.year + 5),
+    );
+    if (pickedDate == null) return;
+
+    final pickedTime = await showTimePicker(context: context, initialTime: TimeOfDay.fromDateTime(initial));
+    final combined = DateTime(pickedDate.year, pickedDate.month, pickedDate.day, pickedTime?.hour ?? 0, pickedTime?.minute ?? 0);
+
+    setState(() {
+      if (forNextFollowUp) _nextFollowUp = combined;
+      else _eventDate = combined;
+    });
+  }
+
+  Widget _dateRow({required String label, DateTime? value, required VoidCallback onTap}) {
+    return InkWell(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 12),
+        decoration: BoxDecoration(
+          color: Colors.grey.shade100,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.grey.shade300),
+        ),
+        child: Row(
+          children: [
+            Icon(label.contains('Follow') ? Icons.event : Icons.event_available, color: Colors.grey.shade700),
+            const SizedBox(width: 12),
+            Text(value != null ? _formatDate(value) : label, style: const TextStyle(fontSize: 14)),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -353,6 +484,13 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
         title: const Text("Lead Details"),
         backgroundColor: Colors.blueAccent,
         foregroundColor: Colors.white,
+        actions: [
+          IconButton(
+            icon: _saving ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2)) : const Icon(Icons.save),
+            onPressed: _saving ? null : _saveAll,
+            tooltip: 'Save All',
+          ),
+        ],
       ),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
@@ -375,12 +513,12 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
             _sectionTitle("Name"),
             TextField(
               controller: _nameController,
-              readOnly: true,
               decoration: InputDecoration(
                 filled: true,
                 fillColor: Colors.grey.shade200,
                 border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
               ),
+              onEditingComplete: _saveAll,
             ),
 
             _sectionTitle("Status"),
@@ -404,6 +542,43 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
                 },
               ),
             ),
+
+            // NEW: Address (editable)
+            _sectionTitle("Address"),
+            TextField(
+              controller: _addressController,
+              maxLines: 2,
+              decoration: InputDecoration(
+                hintText: "Address (optional)",
+                filled: true,
+                fillColor: Colors.grey.shade100,
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+              onEditingComplete: _saveAll,
+            ),
+
+            // NEW: Requirements (editable)
+            _sectionTitle("Requirements"),
+            TextField(
+              controller: _requirementsController,
+              maxLines: 3,
+              decoration: InputDecoration(
+                hintText: "Lead requirements (what they need)",
+                filled: true,
+                fillColor: Colors.grey.shade100,
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+              onEditingComplete: _saveAll,
+            ),
+
+            // NEW: Next follow-up
+            _sectionTitle("Next Follow-up"),
+            _dateRow(label: 'Set next follow-up date', value: _nextFollowUp, onTap: () => _pickDateTime(forNextFollowUp: true)),
+            const SizedBox(height: 12),
+
+            // NEW: Event date
+            _sectionTitle("Event Date"),
+            _dateRow(label: 'Set event date', value: _eventDate, onTap: () => _pickDateTime(forNextFollowUp: false)),
 
             _sectionTitle("Call History"),
             _callHistorySection(),

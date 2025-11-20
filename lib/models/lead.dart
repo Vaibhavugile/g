@@ -1,4 +1,3 @@
-// lib/models/lead.dart
 import 'dart:math';
 import 'package:cloud_firestore/cloud_firestore.dart';
 
@@ -6,6 +5,19 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 String normalizePhone(String? raw) {
   if (raw == null) return '';
   return raw.replaceAll(RegExp(r'\D'), '');
+}
+
+/// Robust timestamp parser used by fromMap()
+DateTime parseTs(Object? v) {
+  if (v == null) return DateTime.fromMillisecondsSinceEpoch(0);
+  if (v is int) return DateTime.fromMillisecondsSinceEpoch(v);
+  if (v is Timestamp) return v.toDate();
+  if (v is String) {
+    final maybeInt = int.tryParse(v);
+    if (maybeInt != null) return DateTime.fromMillisecondsSinceEpoch(maybeInt);
+    return DateTime.tryParse(v) ?? DateTime.fromMillisecondsSinceEpoch(0);
+  }
+  return DateTime.fromMillisecondsSinceEpoch(0);
 }
 
 // Add this to lead.dart (near other model classes)
@@ -163,6 +175,10 @@ class Lead {
   final List<LeadNote> notes;
   final List<CallHistoryEntry> callHistory;
   final bool needsManualReview;
+  final String? address;
+  final String? requirements;
+  final DateTime? nextFollowUp;
+  final DateTime? eventDate;
 
   Lead({
     required this.id,
@@ -175,6 +191,10 @@ class Lead {
     this.notes = const [],
     this.callHistory = const [],
     this.needsManualReview = false,
+    this.address,
+    this.requirements,
+    this.nextFollowUp,
+    this.eventDate,
   });
 
   static String generateId() =>
@@ -194,6 +214,10 @@ class Lead {
       notes: [],
       callHistory: [],
       needsManualReview: false,
+      address: null,
+      requirements: null,
+      nextFollowUp: null,
+      eventDate: null,
     );
   }
 
@@ -208,6 +232,10 @@ class Lead {
     List<LeadNote>? notes,
     List<CallHistoryEntry>? callHistory,
     bool? needsManualReview,
+    String? address,
+    String? requirements,
+    DateTime? nextFollowUp,
+    DateTime? eventDate,
   }) {
     return Lead(
       id: id ?? this.id,
@@ -220,6 +248,11 @@ class Lead {
       notes: notes ?? this.notes,
       callHistory: callHistory ?? this.callHistory,
       needsManualReview: needsManualReview ?? this.needsManualReview,
+      address: address ?? this.address,
+      requirements: requirements ?? this.requirements,
+      nextFollowUp: nextFollowUp ?? this.nextFollowUp,
+      eventDate: eventDate ?? this.eventDate,
+
     );
   }
 
@@ -282,6 +315,12 @@ class Lead {
       }).toList(),
       callHistory: history,
       needsManualReview: (map['needsManualReview'] as bool?) ?? false,
+            // NEW fields
+      address: (map['address'] as String?) ?? null,
+      requirements: (map['requirements'] as String?) ?? null,
+      nextFollowUp: map['nextFollowUp'] != null ? parseTs(map['nextFollowUp']) : null,
+      eventDate: map['eventDate'] != null ? parseTs(map['eventDate']) : null,
+
     );
   }
 
@@ -296,5 +335,10 @@ class Lead {
         'notes': notes.map((e) => e.toMap()).toList(),
         'callHistory': callHistory.map((e) => e.toMap()).toList(),
         'needsManualReview': needsManualReview,
+        'address': address,
+        'requirements': requirements,
+        'nextFollowUp': nextFollowUp != null ? nextFollowUp!.millisecondsSinceEpoch : null,
+        'eventDate': eventDate != null ? eventDate!.millisecondsSinceEpoch : null,
+
       };
 }

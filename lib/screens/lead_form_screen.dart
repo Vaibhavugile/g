@@ -70,6 +70,12 @@ class _LeadFormScreenState extends State<LeadFormScreen> {
   late TextEditingController _noteController;
   late TextEditingController _phoneController;
 
+  // NEW controllers for added fields
+  late TextEditingController _addressController;
+  late TextEditingController _requirementsController;
+  DateTime? _nextFollowUp;
+  DateTime? _eventDate;
+
   bool _hasUnsavedNameChanges = false;
   bool _hasUserSavedOrNoted = false;
 
@@ -94,6 +100,12 @@ class _LeadFormScreenState extends State<LeadFormScreen> {
     _noteController = TextEditingController();
     _phoneController = TextEditingController(text: _lead.phoneNumber);
 
+    // init new controllers and date fields from lead (nullable)
+    _addressController = TextEditingController(text: _lead.address ?? '');
+    _requirementsController = TextEditingController(text: _lead.requirements ?? '');
+    _nextFollowUp = _lead.nextFollowUp;
+    _eventDate = _lead.eventDate;
+
     _nameController.addListener(_checkUnsavedChanges);
 
     // Load the latest call docs for this lead
@@ -113,6 +125,11 @@ class _LeadFormScreenState extends State<LeadFormScreen> {
     _nameController.dispose();
     _noteController.dispose();
     _phoneController.dispose();
+
+    // dispose new controllers
+    _addressController.dispose();
+    _requirementsController.dispose();
+
     super.dispose();
   }
 
@@ -129,10 +146,12 @@ class _LeadFormScreenState extends State<LeadFormScreen> {
         "${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}";
   }
 
+  /// Persist a transient lead (if id empty) and include address/requirements/dates
   Future<void> _persistLeadIfTransient() async {
     if (_lead.id.isEmpty) {
       print("📝 First save: Persisting new lead for ${_lead.phoneNumber}");
       final persistedLead = await _service.createLead(_lead.phoneNumber);
+
       final updatedTransientLead = persistedLead.copyWith(
         name: _nameController.text.trim(),
         status: _lead.status,
@@ -141,10 +160,26 @@ class _LeadFormScreenState extends State<LeadFormScreen> {
         lastCallOutcome: _lead.lastCallOutcome,
         lastInteraction: DateTime.now(),
         lastUpdated: DateTime.now(),
+        address: _addressController.text.trim().isEmpty ? null : _addressController.text.trim(),
+        requirements:
+            _requirementsController.text.trim().isEmpty ? null : _requirementsController.text.trim(),
+        nextFollowUp: _nextFollowUp,
+        eventDate: _eventDate,
       );
+
+      // save (no return expected)
       await _service.saveLead(updatedTransientLead);
+
+      // Try to refresh canonical lead after save; fallback to updatedTransientLead
+      Lead? refreshed;
+      try {
+        refreshed = await _service.getLead(leadId: updatedTransientLead.id);
+      } catch (_) {
+        refreshed = null;
+      }
+
       setState(() {
-        _lead = updatedTransientLead;
+        _lead = refreshed ?? updatedTransientLead;
       });
     }
   }
@@ -160,24 +195,63 @@ class _LeadFormScreenState extends State<LeadFormScreen> {
     }
   }
 
+  /// Save lead including new fields
   Future<void> _saveLead({String? newStatus, String? newName}) async {
     await _persistLeadIfTransient();
 
     final name = newName ?? _nameController.text.trim();
     final status = newStatus ?? _lead.status;
 
-    if (name == _lead.name && status == _lead.status && newStatus == null && newName == null) {
+    // If nothing changed (including new fields), skip
+    final bool fieldsChanged = name != _lead.name ||
+        status != _lead.status ||
+        (_addressController.text.trim().isNotEmpty && _addressController.text.trim() != (_lead.address ?? '')) ||
+        (_requirementsController.text.trim().isNotEmpty &&
+            _requirementsController.text.trim() != (_lead.requirements ?? '')) ||
+        _nextFollowUp != _lead.nextFollowUp ||
+        _eventDate != _lead.eventDate;
+
+    if (!fieldsChanged && newStatus == null && newName == null) {
       return;
     }
 
-    final updated = await _service.updateLead(id: _lead.id, name: name, status: status);
+    // Build updated lead with all fields
+    final updatedLead = _lead.copyWith(
+      name: name,
+      status: status,
+      address: _addressController.text.trim().isEmpty ? null : _addressController.text.trim(),
+      requirements:
+          _requirementsController.text.trim().isEmpty ? null : _requirementsController.text.trim(),
+      nextFollowUp: _nextFollowUp,
+      eventDate: _eventDate,
+      lastUpdated: DateTime.now(),
+      lastInteraction: DateTime.now(),
+    );
+
+    // Persist using saveLead (returns void in your service).
+    await _service.saveLead(updatedLead);
+
+    // Try to fetch canonical saved lead; if not available, fallback to updatedLead
+    Lead? refreshed;
+    try {
+      refreshed = await _service.getLead(leadId: updatedLead.id);
+    } catch (e) {
+      print('Warning: could not fetch refreshed lead after save: $e');
+      refreshed = null;
+    }
+    final savedLead = refreshed ?? updatedLead;
 
     _hasUserSavedOrNoted = true;
 
     setState(() {
-      _lead = updated;
+      _lead = savedLead;
       _hasUnsavedNameChanges = false;
       _nameController.text = _lead.name;
+      // ensure controllers reflect saved values
+      _addressController.text = _lead.address ?? '';
+      _requirementsController.text = _lead.requirements ?? '';
+      _nextFollowUp = _lead.nextFollowUp;
+      _eventDate = _lead.eventDate;
     });
 
     _checkUnsavedChanges();
@@ -205,6 +279,10 @@ class _LeadFormScreenState extends State<LeadFormScreen> {
           _lead = updatedLead;
           _nameController.text = _lead.name;
           _phoneController.text = _lead.phoneNumber;
+          _addressController.text = _lead.address ?? '';
+          _requirementsController.text = _lead.requirements ?? '';
+          _nextFollowUp = _lead.nextFollowUp;
+          _eventDate = _lead.eventDate;
         }
       });
       // refresh latest calls after adding a note (safe no-op if nothing changed)
@@ -292,6 +370,25 @@ class _LeadFormScreenState extends State<LeadFormScreen> {
                 'Last Call Outcome: ${callOutcome}',
                 style: TextStyle(fontSize: 16, color: outcomeColor, fontWeight: FontWeight.w700),
               ),
+            ],
+            // Show saved address / requirements summary in header (small)
+            if ((_lead.address ?? '').isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Text('Address: ${_lead.address}', style: const TextStyle(fontSize: 13)),
+            ],
+            if ((_lead.requirements ?? '').isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text('Requirements: ${_lead.requirements}', style: const TextStyle(fontSize: 13)),
+            ],
+            if (_lead.nextFollowUp != null || _lead.eventDate != null) ...[
+              const SizedBox(height: 10),
+              Row(children: [
+                if (_lead.nextFollowUp != null)
+                  Chip(label: Text('Follow: ${_formatDate(_lead.nextFollowUp!)}')),
+                const SizedBox(width: 8),
+                if (_lead.eventDate != null)
+                  Chip(label: Text('Event: ${_formatDate(_lead.eventDate!)}')),
+              ])
             ]
           ],
         ),
@@ -427,6 +524,50 @@ class _LeadFormScreenState extends State<LeadFormScreen> {
     );
   }
 
+  // ------------------------------
+  // Date/time pickers helpers UI
+  // ------------------------------
+  Future<void> _pickDateTime({required bool forNextFollowUp}) async {
+    final now = DateTime.now();
+    final initial = forNextFollowUp ? (_nextFollowUp ?? now) : (_eventDate ?? now);
+    final pickedDate = await showDatePicker(
+      context: context,
+      initialDate: initial,
+      firstDate: DateTime(now.year - 5),
+      lastDate: DateTime(now.year + 5),
+    );
+    if (pickedDate == null) return;
+
+    final pickedTime = await showTimePicker(context: context, initialTime: TimeOfDay.fromDateTime(initial));
+    final combined = DateTime(pickedDate.year, pickedDate.month, pickedDate.day, pickedTime?.hour ?? 0, pickedTime?.minute ?? 0);
+
+    setState(() {
+      if (forNextFollowUp) _nextFollowUp = combined;
+      else _eventDate = combined;
+    });
+  }
+
+  Widget _dateButton({required String label, DateTime? value, required VoidCallback onTap}) {
+    return InkWell(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 12),
+        decoration: BoxDecoration(
+          color: Colors.grey.shade100,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.grey.shade300),
+        ),
+        child: Row(
+          children: [
+            Icon(label.contains('Follow') ? Icons.event : Icons.event_available, color: Colors.grey.shade700),
+            const SizedBox(width: 12),
+            Text(value != null ? _formatDate(value) : label, style: const TextStyle(fontSize: 14)),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -443,6 +584,11 @@ class _LeadFormScreenState extends State<LeadFormScreen> {
               onPressed: () => _saveLead(newName: _nameController.text.trim()),
               tooltip: 'Save Name',
             ),
+          IconButton(
+            icon: const Icon(Icons.save_alt),
+            onPressed: () => _saveLead(),
+            tooltip: 'Save All',
+          ),
         ],
       ),
       body: SingleChildScrollView(
@@ -492,6 +638,51 @@ class _LeadFormScreenState extends State<LeadFormScreen> {
               },
             ),
           ),
+
+          // NEW: Address field
+          _sectionTitle("Address"),
+          TextField(
+            controller: _addressController,
+            decoration: InputDecoration(
+              hintText: "Address (optional)",
+              filled: true,
+              fillColor: Colors.grey.shade100,
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+            ),
+            onEditingComplete: () => _saveLead(),
+          ),
+
+          // NEW: Requirements (multi-line)
+          _sectionTitle("Requirements"),
+          TextField(
+            controller: _requirementsController,
+            maxLines: 3,
+            decoration: InputDecoration(
+              hintText: "What does the lead require? (free-text)",
+              filled: true,
+              fillColor: Colors.grey.shade100,
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+            ),
+            onEditingComplete: () => _saveLead(),
+          ),
+
+          // NEW: Next follow-up (date & time picker)
+          _sectionTitle("Next Follow-up"),
+          _dateButton(
+            label: 'Set next follow-up date',
+            value: _nextFollowUp,
+            onTap: () => _pickDateTime(forNextFollowUp: true),
+          ),
+          const SizedBox(height: 12),
+
+          // NEW: Event date (date & time picker)
+          _sectionTitle("Event Date"),
+          _dateButton(
+            label: 'Set event date',
+            value: _eventDate,
+            onTap: () => _pickDateTime(forNextFollowUp: false),
+          ),
+
           _sectionTitle("Call History"),
           _callHistorySection(),
           _sectionTitle("Notes"),
