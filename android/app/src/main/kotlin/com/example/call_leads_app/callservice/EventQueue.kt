@@ -17,6 +17,7 @@ import org.json.JSONObject
  *
  * Additional helpers added:
  *  - removeOldEntriesOlderThan: allow garbage-collection of stale head items (by receivedAt).
+ *  - MAX_QUEUE_SIZE to prevent unbounded growth (defensive).
  */
 class EventQueue(private val ctx: Context) {
 
@@ -27,6 +28,10 @@ class EventQueue(private val ctx: Context) {
     private val prefs get() = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
 
     private val lock = Any()
+
+    // Defensive cap to avoid unbounded SharedPreferences growth.
+    // Very unlikely to reach this in normal operation; adjust if needed.
+    private val MAX_QUEUE_SIZE = 1000
 
     /**
      * Safely parse stored JSON array. If broken, repair by resetting to [].
@@ -42,10 +47,20 @@ class EventQueue(private val ctx: Context) {
     }
 
     /**
-     * Save JSONArray safely.
+     * Save JSONArray safely. If saving the full JSON fails for any reason, attempt a safe
+     * fallback (clear queue) to avoid leaving corrupt state that could crash readers.
      */
     private fun saveArray(arr: JSONArray) {
-        prefs.edit().putString(KEY, arr.toString()).apply()
+        try {
+            prefs.edit().putString(KEY, arr.toString()).apply()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to persist EventQueue JSON: ${e.localizedMessage}. Clearing queue to recover.")
+            try {
+                prefs.edit().remove(KEY).apply()
+            } catch (ex: Exception) {
+                Log.e(TAG, "Failed to clear corrupted queue key: ${ex.localizedMessage}")
+            }
+        }
     }
 
     /**
@@ -58,11 +73,17 @@ class EventQueue(private val ctx: Context) {
                 when (v) {
                     null -> jo.put(k, JSONObject.NULL)
                     is Number, is String, is Boolean -> jo.put(k, v)
+                    is Map<*, *> -> jo.put(k, JSONObject(v as Map<*, *>))
+                    is Collection<*> -> jo.put(k, JSONArray(v.toList()))
                     else -> jo.put(k, v.toString()) // fallback for any unsupported type
                 }
             } catch (e: Exception) {
                 // final fallback
-                jo.put(k, v?.toString() ?: JSONObject.NULL)
+                try {
+                    jo.put(k, v?.toString() ?: JSONObject.NULL)
+                } catch (ex: Exception) {
+                    // give up on this field
+                }
             }
         }
         return jo
@@ -74,12 +95,25 @@ class EventQueue(private val ctx: Context) {
 
     /**
      * Add event to end of queue.
+     * Trims oldest entries if queue exceeds MAX_QUEUE_SIZE to prevent unbounded growth.
      */
     fun enqueue(event: Map<String, Any?>) {
         synchronized(lock) {
             val arr = loadArray()
             arr.put(toSafeJson(event))
-            saveArray(arr)
+
+            // Trim if it exceeds cap (remove oldest entries)
+            if (arr.length() > MAX_QUEUE_SIZE) {
+                val trimmed = JSONArray()
+                val start = arr.length() - MAX_QUEUE_SIZE
+                for (i in start until arr.length()) {
+                    trimmed.put(arr.get(i))
+                }
+                saveArray(trimmed)
+                Log.w(TAG, "EventQueue exceeded MAX_QUEUE_SIZE; trimmed to last $MAX_QUEUE_SIZE entries.")
+            } else {
+                saveArray(arr)
+            }
         }
     }
 
@@ -131,7 +165,11 @@ class EventQueue(private val ctx: Context) {
      */
     fun clear() {
         synchronized(lock) {
-            prefs.edit().remove(KEY).apply()
+            try {
+                prefs.edit().remove(KEY).apply()
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to clear EventQueue: ${e.localizedMessage}")
+            }
         }
     }
 

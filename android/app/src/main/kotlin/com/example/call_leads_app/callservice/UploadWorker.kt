@@ -45,6 +45,10 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
     private val queue = EventQueue(appContext)
     private val PREFS = "call_leads_prefs"
 
+    // Keep these in sync with CallService / receivers
+    private val REUSE_WINDOW_MS = 120_000L            // 2 minutes fallback
+    private val ACTIVE_CALL_TTL_MS = 60 * 60 * 1000L // 1 hour active TTL
+
     override suspend fun doWork(): Result {
         try {
             // Garbage-collect stale head entries so they don't block the queue indefinitely.
@@ -148,6 +152,16 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                         findOpenCallIdForLeadOrGenerate(firestore, leadId, phone, ts)
                     }
 
+                    // If the worker generated a callId (i.e. callIdFromEvent == null and find returned a gen),
+                    // ensure we persist a reverse mapping so later retries/EnqueueEventWorker can recover phone.
+                    if (callIdFromEvent.isNullOrEmpty()) {
+                        try {
+                            markCallActiveForPhone(applicationContext, phone, callId)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed to persist reverse mapping for generated callId: ${e.localizedMessage}")
+                        }
+                    }
+
                     val leadRefPath = "leads/$leadId"
                     val callRefPath = "$leadRefPath/calls/$callId"
 
@@ -176,7 +190,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
 
                     val isFinal = (outcome == "ended" || duration != null)
                     val finalizeFields = if (isFinal) {
-                        val ff = mutableMapOf<String, Any?>(
+                        val ff = mutableMapOf<String, Any?>( //
                             "finalOutcome" to outcome,
                             "finalizedAt" to FieldValue.serverTimestamp()
                         )
@@ -311,8 +325,9 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
 
     private fun leadIdFromPhone(phoneDigits: String): String {
         // deterministic but short hash of digits
-        val digest = sha1(phoneDigits).substring(0, 12)
-        return "phone_$digest"
+        val digestFull = sha1(phoneDigits)
+        val safeSub = if (digestFull.length >= 12) digestFull.substring(0, 12) else digestFull
+        return "phone_$safeSub"
     }
 
     private fun generateCallId(ts: Long): String {
@@ -369,6 +384,9 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
     /**
      * Attempt to recover a phone number using the shared prefs mapping for callId.
      * This is a fast synchronous lookup used as a last-ditch attempt before skipping an item.
+     *
+     * Improved: prefers direct mapping and then scans legacy keys but only returns candidates
+     * that are still active (callid_active_until > now) or very recent (callid_ts within REUSE_WINDOW_MS).
      */
     private fun tryRecoverPhoneForCallId(ctx: Context, callId: String): String? {
         try {
@@ -376,16 +394,53 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
             // direct reverse mapping
             val direct = prefs.getString("callid_to_phone_$callId", null)
             if (!direct.isNullOrEmpty()) return direct
-            // legacy fallback: look for keys named callid_<phone> == callId
+
+            // legacy fallback: look for keys named callid_<phone> == callId but check activity/recency
             val all = prefs.all
+            val now = System.currentTimeMillis()
             for ((k, v) in all) {
-                if (k.startsWith("callid_") && v is String && v == callId) {
-                    return k.removePrefix("callid_")
+                if (!k.startsWith("callid_")) continue
+                // skip helper keys
+                if (k.startsWith("callid_to_phone_") || k.startsWith("callid_active_until_") || k.startsWith("callid_ts_")) continue
+                val value = v as? String ?: continue
+                if (value != callId) continue
+
+                val normalized = k.removePrefix("callid_")
+                val activeUntil = prefs.getLong("callid_active_until_$normalized", 0L)
+                if (activeUntil > now) {
+                    return normalized
                 }
+                val ts = prefs.getLong("callid_ts_$normalized", 0L)
+                if (ts != 0L && (now - ts) <= REUSE_WINDOW_MS) {
+                    return normalized
+                }
+                // else too old, continue scanning
             }
         } catch (e: Exception) {
             Log.w(TAG, "tryRecoverPhoneForCallId failed: ${e.localizedMessage}")
         }
         return null
+    }
+
+    /**
+     * Persist reverse & forward mappings for an active call so other components can recover phone by callId.
+     * Called when the worker generates a callId to ensure later recovery.
+     */
+    private fun markCallActiveForPhone(ctx: Context, phoneDigitsOrRaw: String, callId: String) {
+        try {
+            val normalized = normalizeNumber(phoneDigitsOrRaw)
+            if (normalized.isEmpty()) return
+            val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val now = System.currentTimeMillis()
+            prefs.edit()
+                .putString("callid_$normalized", callId)
+                .putLong("callid_ts_$normalized", now)
+                .putLong("callid_active_until_$normalized", now + ACTIVE_CALL_TTL_MS)
+                .putString("callid_to_phone_$callId", normalized)
+                .apply()
+            Log.d(TAG, "Worker-marked call active: $normalized -> $callId")
+        } catch (e: Exception) {
+            Log.w(TAG, "markCallActiveForPhone failed in worker: ${e.localizedMessage}")
+        }
     }
 }

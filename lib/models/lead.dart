@@ -8,6 +8,53 @@ String normalizePhone(String? raw) {
   return raw.replaceAll(RegExp(r'\D'), '');
 }
 
+// Add this to lead.dart (near other model classes)
+
+class LatestCall {
+  final String? callId;
+  final String? phoneNumber;
+  final String? direction; // "inbound" / "outbound"
+  final String? finalOutcome; // "ended" / "missed" / "rejected" etc.
+  final int? durationInSeconds;
+  final DateTime? createdAt;
+  final DateTime? finalizedAt;
+
+  LatestCall({
+    this.callId,
+    this.phoneNumber,
+    this.direction,
+    this.finalOutcome,
+    this.durationInSeconds,
+    this.createdAt,
+    this.finalizedAt,
+  });
+
+  factory LatestCall.fromDoc(QueryDocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>;
+    DateTime? _ts(Object? v) {
+      if (v == null) return null;
+      if (v is Timestamp) return v.toDate();
+      if (v is DateTime) return v;
+      try {
+        return DateTime.parse(v.toString());
+      } catch (_) {
+        return null;
+      }
+    }
+
+    return LatestCall(
+      callId: doc.id,
+      phoneNumber: (data['phoneNumber'] as String?)?.trim(),
+      direction: (data['direction'] as String?)?.toLowerCase(),
+      finalOutcome: (data['finalOutcome'] as String?)?.toLowerCase(),
+      durationInSeconds: data['durationInSeconds'] is num ? (data['durationInSeconds'] as num).toInt() : null,
+      createdAt: _ts(data['createdAt']),
+      finalizedAt: _ts(data['finalizedAt']),
+    );
+  }
+}
+
+
 /// Entry in call history.
 class CallHistoryEntry {
   final String direction; // inbound / outbound

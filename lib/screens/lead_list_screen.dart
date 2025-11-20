@@ -1,6 +1,6 @@
 // lib/screens/lead_list_screen.dart
-
 import 'package:flutter/material.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import '../models/lead.dart';
 import '../services/lead_service.dart';
 import 'lead_form_screen.dart';
@@ -18,6 +18,52 @@ class LeadListScreen extends StatefulWidget {
 
   @override
   State<LeadListScreen> createState() => _LeadListScreenState();
+}
+
+// Lightweight model for the latest call (kept local here to avoid requiring lead.dart edits)
+class LatestCall {
+  final String? callId;
+  final String? phoneNumber;
+  final String? direction; // inbound / outbound
+  final String? finalOutcome; // ended / missed / rejected
+  final int? durationInSeconds;
+  final DateTime? createdAt;
+  final DateTime? finalizedAt;
+
+  LatestCall({
+    this.callId,
+    this.phoneNumber,
+    this.direction,
+    this.finalOutcome,
+    this.durationInSeconds,
+    this.createdAt,
+    this.finalizedAt,
+  });
+
+  factory LatestCall.fromDoc(QueryDocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>;
+
+    DateTime? _toDate(Object? v) {
+      if (v == null) return null;
+      if (v is Timestamp) return v.toDate();
+      if (v is DateTime) return v;
+      try {
+        return DateTime.parse(v.toString());
+      } catch (_) {
+        return null;
+      }
+    }
+
+    return LatestCall(
+      callId: doc.id,
+      phoneNumber: (data['phoneNumber'] as String?)?.trim(),
+      direction: (data['direction'] as String?)?.toLowerCase(),
+      finalOutcome: (data['finalOutcome'] as String?)?.toLowerCase(),
+      durationInSeconds: data['durationInSeconds'] is num ? (data['durationInSeconds'] as num).toInt() : null,
+      createdAt: _toDate(data['createdAt']),
+      finalizedAt: _toDate(data['finalizedAt']),
+    );
+  }
 }
 
 class _LeadListScreenState extends State<LeadListScreen> {
@@ -43,6 +89,10 @@ class _LeadListScreenState extends State<LeadListScreen> {
     'Rejected'
   ];
 
+  // Map leadId -> LatestCall (fetched from calls subcollection)
+  final Map<String, LatestCall?> _latestCallByLead = {};
+  bool _loadingLatestCalls = false;
+
   @override
   void initState() {
     super.initState();
@@ -57,6 +107,27 @@ class _LeadListScreenState extends State<LeadListScreen> {
     super.dispose();
   }
 
+  /// Fetch the single most recent call doc for the given lead.
+  Future<LatestCall?> fetchLatestCallForLead(String leadId) async {
+    try {
+      final q = await FirebaseFirestore.instance
+          .collection('leads')
+          .doc(leadId)
+          .collection('calls')
+          .orderBy('createdAt', descending: true)
+          .limit(1)
+          .get();
+      if (q.docs.isEmpty) return null;
+      return LatestCall.fromDoc(q.docs.first);
+    } catch (e, st) {
+      // keep UI resilient: log and return null
+      // ignore: avoid_print
+      print('fetchLatestCallForLead error for $leadId: $e\n$st');
+      return null;
+    }
+  }
+
+  /// Load leads and in parallel fetch latest calls (batched to avoid too many concurrent reads)
   Future<void> _loadLeads() async {
     setState(() => _loading = true);
 
@@ -70,9 +141,29 @@ class _LeadListScreenState extends State<LeadListScreen> {
     // Sort -> latest interaction first (mutable list sort is fine now)
     _allLeads.sort((a, b) => b.lastInteraction.compareTo(a.lastInteraction));
 
+    // Clear previous latest map
+    _latestCallByLead.clear();
+    _loadingLatestCalls = true;
+
+    // Fetch latest calls in batches to limit concurrent reads (batchSize tuned to 10)
+    const int batchSize = 10;
+    for (var i = 0; i < _allLeads.length; i += batchSize) {
+      final batch = _allLeads.skip(i).take(batchSize).toList();
+      final futures = batch.map((l) => fetchLatestCallForLead(l.id)).toList();
+      final results = await Future.wait(futures);
+      for (var j = 0; j < batch.length; j++) {
+        _latestCallByLead[batch[j].id] = results[j];
+      }
+      // update UI incrementally so user sees chips appear
+      setState(() {});
+    }
+
     _applySearch(); // Apply search and filter after loading
 
-    setState(() => _loading = false);
+    setState(() {
+      _loading = false;
+      _loadingLatestCalls = false;
+    });
   }
 
   void _applySearch() {
@@ -83,7 +174,7 @@ class _LeadListScreenState extends State<LeadListScreen> {
       return l.name.toLowerCase().contains(query) || l.phoneNumber.contains(query);
     }).toList();
 
-    // 2. Apply call/review filter
+    // 2. Apply call/review filter - use _latestCallByLead if available
     _filteredLeads = searchFiltered.where((l) {
       if (_selectedFilter == 'All') return true;
 
@@ -92,20 +183,36 @@ class _LeadListScreenState extends State<LeadListScreen> {
         return l.needsManualReview;
       }
 
-      // If no call history, it can't match any call-specific filters
-      if (l.callHistory.isEmpty) return false;
+      // Prefer latest-call data
+      final LatestCall? latest = _latestCallByLead[l.id];
 
-      // Filter by Outcome (uses the new lastCallOutcome field)
-      if (_selectedFilter == 'Answered' && l.lastCallOutcome == 'answered') return true;
-      if (_selectedFilter == 'Missed' && l.lastCallOutcome == 'missed') return true;
-      if (_selectedFilter == 'Rejected' && l.lastCallOutcome == 'rejected') return true;
+      // If we don't have latest-call data yet, attempt to fall back to existing fields
+      if (latest == null) {
+        // If no call history, it can't match call-specific filters
+        if (l.callHistory.isEmpty) return false;
 
-      // Filter by Direction (uses the last entry in callHistory)
-      final lastCall = l.callHistory.last;
-      if (_selectedFilter == 'Incoming' && lastCall.direction == 'inbound') return true;
-      if (_selectedFilter == 'Outgoing' && lastCall.direction == 'outbound') return true;
+        // Fallback to legacy behavior (lastCallOutcome / callHistory.last)
+        if (_selectedFilter == 'Answered' && l.lastCallOutcome == 'answered') return true;
+        if (_selectedFilter == 'Missed' && l.lastCallOutcome == 'missed') return true;
+        if (_selectedFilter == 'Rejected' && l.lastCallOutcome == 'rejected') return true;
 
-      // If none of the specific filters matched, exclude the lead
+        final lastCall = l.callHistory.last;
+        if (_selectedFilter == 'Incoming' && lastCall.direction == 'inbound') return true;
+        if (_selectedFilter == 'Outgoing' && lastCall.direction == 'outbound') return true;
+
+        return false;
+      }
+
+      // Use latest call values
+      final outcome = latest.finalOutcome?.toLowerCase();
+      final direction = latest.direction?.toLowerCase();
+
+      if (_selectedFilter == 'Answered') return (outcome == 'answered' || outcome == 'ended');
+      if (_selectedFilter == 'Missed') return outcome == 'missed';
+      if (_selectedFilter == 'Rejected') return outcome == 'rejected';
+      if (_selectedFilter == 'Incoming') return direction == 'inbound';
+      if (_selectedFilter == 'Outgoing') return direction == 'outbound';
+
       return false;
     }).toList();
 
@@ -152,21 +259,65 @@ class _LeadListScreenState extends State<LeadListScreen> {
     );
   }
 
+  // small helper to format relative time
+  String? timeAgo(DateTime dt) {
+    final diff = DateTime.now().difference(dt);
+    if (diff.inSeconds < 60) return '${diff.inSeconds}s';
+    if (diff.inMinutes < 60) return '${diff.inMinutes}m';
+    if (diff.inHours < 24) return '${diff.inHours}h';
+    return '${diff.inDays}d';
+  }
+
   // -----------------------------------------
   // UI: LEAD CARD (Premium UI/UX and Review Highlight)
   // -----------------------------------------
   Widget _leadCard(Lead lead) {
     final bool needsReview = lead.needsManualReview;
 
-    // Set colors for the last call outcome chip
+    // Get latest call for this lead (if available)
+    final latest = _latestCallByLead[lead.id];
+
+    // Decide colors based on latest call (fallback to legacy lead.lastCallOutcome)
+    String displayOutcome = 'NONE';
     Color outcomeColor = Colors.grey.shade600;
     Color outcomeBgColor = Colors.grey.shade200;
-    if (lead.lastCallOutcome == 'missed' || lead.lastCallOutcome == 'rejected') {
-      outcomeColor = Colors.red.shade700;
-      outcomeBgColor = Colors.red.withOpacity(0.1);
-    } else if (lead.lastCallOutcome == 'answered') {
-      outcomeColor = Colors.green.shade700;
-      outcomeBgColor = Colors.green.withOpacity(0.1);
+
+    if (latest != null && latest.finalOutcome != null) {
+      displayOutcome = latest.finalOutcome!.toUpperCase();
+      if (latest.finalOutcome == 'missed' || latest.finalOutcome == 'rejected') {
+        outcomeColor = Colors.red.shade700;
+        outcomeBgColor = Colors.red.withOpacity(0.1);
+      } else if (latest.finalOutcome == 'answered' || latest.finalOutcome == 'ended') {
+        outcomeColor = Colors.green.shade700;
+        outcomeBgColor = Colors.green.withOpacity(0.1);
+      }
+    } else if (lead.lastCallOutcome != 'none') {
+      displayOutcome = lead.lastCallOutcome.toUpperCase();
+      if (lead.lastCallOutcome == 'missed' || lead.lastCallOutcome == 'rejected') {
+        outcomeColor = Colors.red.shade700;
+        outcomeBgColor = Colors.red.withOpacity(0.1);
+      } else if (lead.lastCallOutcome == 'answered') {
+        outcomeColor = Colors.green.shade700;
+        outcomeBgColor = Colors.green.withOpacity(0.1);
+      }
+    }
+
+    // Extra small chips: direction, duration, time
+    final List<Widget> extraChips = [];
+    if (latest != null) {
+      if (latest.direction != null && latest.direction!.isNotEmpty) {
+        extraChips.add(Chip(label: Text(latest.direction!.toUpperCase()), visualDensity: VisualDensity.compact));
+      }
+      if (latest.durationInSeconds != null) {
+        extraChips.add(Chip(label: Text('${latest.durationInSeconds}s'), visualDensity: VisualDensity.compact));
+      }
+      if (latest.createdAt != null) {
+        final when = timeAgo(latest.createdAt!);
+        if (when != null) extraChips.add(Chip(label: Text(when), visualDensity: VisualDensity.compact));
+      }
+    } else if (lead.callHistory.isNotEmpty) {
+      final last = lead.callHistory.last;
+      extraChips.add(Chip(label: Text(last.direction.toUpperCase()), visualDensity: VisualDensity.compact));
     }
 
     return Card(
@@ -209,16 +360,17 @@ class _LeadListScreenState extends State<LeadListScreen> {
               runSpacing: 4.0, // space between rows of chips
               children: [
                 _statusChip(lead.status),
-                if (lead.lastCallOutcome != 'none')
+                if (displayOutcome != 'NONE')
                   Chip(
                     label: Text(
-                      lead.lastCallOutcome.toUpperCase(),
+                      displayOutcome,
                       style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold),
                     ),
                     backgroundColor: outcomeBgColor,
                     labelStyle: TextStyle(color: outcomeColor),
                     visualDensity: VisualDensity.compact,
                   ),
+                ...extraChips,
                 if (needsReview)
                   Chip(
                     label: const Text(
@@ -246,7 +398,7 @@ class _LeadListScreenState extends State<LeadListScreen> {
     return Scaffold(
       backgroundColor: _backgroundColor,
       appBar: AppBar(
-        title: const Text("Lead List"),
+        title: const Text("Lead L"),
         backgroundColor: _primaryColor, // Premium Primary Color
         foregroundColor: Colors.white,
         elevation: 0,

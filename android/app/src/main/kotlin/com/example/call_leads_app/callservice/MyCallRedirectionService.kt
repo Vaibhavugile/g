@@ -15,6 +15,10 @@ class MyCallRedirectionService : CallRedirectionService() {
     private val KEY_LAST_OUTGOING = "last_outgoing_number"
     private val KEY_LAST_OUTGOING_TS = "last_outgoing_ts"
 
+    // Active/recency semantics (keep in sync with CallService)
+    private val REUSE_WINDOW_MS = 120_000L            // 2 minutes fallback
+    private val ACTIVE_CALL_TTL_MS = 60 * 60 * 1000L // 1 hour active TTL
+
     private val CALL_SERVICE_CLASS_NAME = "com.example.call_leads_app.callservice.CallService"
 
     override fun onPlaceCall(handle: Uri, phoneAccount: PhoneAccountHandle, allowInteractiveResponse: Boolean) {
@@ -34,9 +38,9 @@ class MyCallRedirectionService : CallRedirectionService() {
                 .apply()
             Log.d(TAG, "Saved outgoing marker for $normalized")
 
-            // lookup-first: reuse callId if exists
-            val existing = prefs.getString("callid_$normalized", null)
-            val callId = existing ?: ensureCallIdForPhone(normalized, prefs)
+            // lookup-first: reuse callId if exists (active-or-recent), otherwise create & mark active
+            val existing = readActiveOrRecentCallId(this, normalized)
+            val callId = existing ?: ensureCallIdForPhone(this, normalized)
 
             if (existing != null) {
                 Log.d(TAG, "Reused existing callId for $normalized -> $existing")
@@ -69,18 +73,63 @@ class MyCallRedirectionService : CallRedirectionService() {
         return if (digits.isEmpty()) null else digits
     }
 
-    private fun ensureCallIdForPhone(phoneDigitsOrRaw: String?, prefs: android.content.SharedPreferences): String {
+    // -----------------------
+    // CallId lifecycle helpers (active + recent semantics)
+    // -----------------------
+    private fun markCallActiveForPhone(ctx: android.content.Context, phoneDigitsOrRaw: String, callId: String) {
+        try {
+            val normalized = normalizeNumber(phoneDigitsOrRaw) ?: phoneDigitsOrRaw
+            val prefs = ctx.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
+            val now = System.currentTimeMillis()
+            prefs.edit()
+                .putString("callid_$normalized", callId)
+                .putLong("callid_ts_$normalized", now)
+                .putLong("callid_active_until_$normalized", now + ACTIVE_CALL_TTL_MS)
+                .putString("callid_to_phone_$callId", normalized)
+                .apply()
+            Log.d(TAG, "Marked call active for $normalized -> $callId until ${now + ACTIVE_CALL_TTL_MS}")
+        } catch (e: Exception) {
+            Log.w(TAG, "markCallActiveForPhone failed: ${e.localizedMessage}")
+        }
+    }
+
+    private fun readActiveOrRecentCallId(ctx: android.content.Context, phoneDigitsOrRaw: String): String? {
+        try {
+            val normalized = normalizeNumber(phoneDigitsOrRaw) ?: phoneDigitsOrRaw
+            val prefs = ctx.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
+            val id = prefs.getString("callid_$normalized", null) ?: return null
+            val now = System.currentTimeMillis()
+
+            val activeUntil = prefs.getLong("callid_active_until_$normalized", 0L)
+            if (activeUntil > now) {
+                Log.d(TAG, "Reusing ACTIVE callId for $normalized -> $id (activeUntil=$activeUntil)")
+                return id
+            }
+
+            val ts = prefs.getLong("callid_ts_$normalized", 0L)
+            if (ts != 0L && (now - ts) <= REUSE_WINDOW_MS) {
+                Log.d(TAG, "Reusing RECENT callId for $normalized -> $id (ts=$ts)")
+                return id
+            }
+
+            return null
+        } catch (e: Exception) {
+            Log.w(TAG, "readActiveOrRecentCallId failed: ${e.localizedMessage}")
+            return null
+        }
+    }
+
+    private fun ensureCallIdForPhone(ctx: android.content.Context, phoneDigitsOrRaw: String?): String {
         try {
             val normalized = normalizeNumber(phoneDigitsOrRaw) ?: phoneDigitsOrRaw ?: return generateCallId()
+            val prefs = ctx.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
             val existing = prefs.getString("callid_$normalized", null)
             if (!existing.isNullOrEmpty()) return existing
 
             val newId = generateCallId()
-            prefs.edit()
-                .putString("callid_$normalized", newId)
-                .putLong("callid_ts_$normalized", System.currentTimeMillis())
-                .putString("callid_to_phone_$newId", normalized)
-                .apply()
+            // mark active (this writes callid_, ts and active_until and reverse mapping)
+            markCallActiveForPhone(ctx, normalized, newId)
+            Log.d(TAG, "ensureCallIdForPhone created and marked active: $normalized -> $newId")
             return newId
         } catch (e: Exception) {
             Log.w(TAG, "ensureCallIdForPhone failed: ${e.localizedMessage}")

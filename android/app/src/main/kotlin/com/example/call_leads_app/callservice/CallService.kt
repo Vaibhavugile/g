@@ -56,6 +56,9 @@ class CallService : Service() {
         private const val NOTIF_CHANNEL_ID = "call_channel"
         private const val NOTIF_CHANNEL_NAME = "Call Tracking"
 
+        // NEW: reuse window + active TTL to support long calls (10-15min+)
+        private const val REUSE_WINDOW_MS = 120_000L            // 2 minutes fallback
+        private const val ACTIVE_CALL_TTL_MS = 60 * 60 * 1000L // 1 hour active TTL
         /**
          * Flush any buffered pendingEvents into the current eventSink if available.
          * This helper is safe to call multiple times and handles exceptions internally.
@@ -223,19 +226,24 @@ class CallService : Service() {
     /**
      * Ensure we have a callId for the given normalized phone. Lookup-first: reuse existing mapping
      * if present; otherwise create and persist a new mapping.
+     *
+     * NOTE: ensureCallIdForPhone now marks the mapping active (sets active-until) so it is reused
+     * for the duration of the call. It still returns the existing mapping if present.
      */
     private fun ensureCallIdForPhone(normalizedPhone: String?, prefs: SharedPreferences): String? {
         try {
             if (normalizedPhone.isNullOrEmpty()) return null
             val existing = prefs.getString("callid_$normalizedPhone", null)
-            if (!existing.isNullOrEmpty()) return existing
+            if (!existing.isNullOrEmpty()) {
+                // backfill timestamp if missing
+                val ts = prefs.getLong("callid_ts_$normalizedPhone", 0L)
+                if (ts == 0L) prefs.edit().putLong("callid_ts_$normalizedPhone", System.currentTimeMillis()).apply()
+                return existing
+            }
 
             val newId = generateCallId()
-            prefs.edit()
-                .putString("callid_$normalizedPhone", newId)
-                .putLong("callid_ts_$normalizedPhone", System.currentTimeMillis())
-                .putString("callid_to_phone_$newId", normalizedPhone)
-                .apply()
+            // Use markCallActiveForPhone which sets id, ts and active-until
+            markCallActiveForPhone(applicationContext, normalizedPhone, newId)
             Log.d(TAG, "Saved callId marker for $normalizedPhone -> $newId (ensureCallIdForPhone)")
             return newId
         } catch (e: Exception) {
@@ -267,11 +275,12 @@ class CallService : Service() {
             if (callId.isNullOrEmpty()) {
                 try {
                     if (!normalizedPhone.isNullOrEmpty()) {
-                        val existing = prefs.getString("callid_$normalizedPhone", null)
+                        // NEW: prefer active-or-recent mapping
+                        val existing = readActiveOrRecentCallId(applicationContext, normalizedPhone)
                         if (!existing.isNullOrEmpty()) {
                             callId = existing
                             mutable["callId"] = callId
-                            Log.d(TAG, "Reused existing callId marker for $normalizedPhone -> $callId (persistAndForwardEvent)")
+                            Log.d(TAG, "Reused existing active/recent callId marker for $normalizedPhone -> $callId (persistAndForwardEvent)")
                         }
                     }
                 } catch (e: Exception) {
@@ -286,11 +295,8 @@ class CallService : Service() {
                 try {
                     val markerKey = if (!normalizedPhone.isNullOrEmpty()) normalizedPhone else (phoneRaw ?: "")
                     if (markerKey.isNotEmpty()) {
-                        prefs.edit()
-                            .putString("callid_$markerKey", callId)
-                            .putLong("callid_ts_$markerKey", System.currentTimeMillis())
-                            .putString("callid_to_phone_$callId", markerKey)
-                            .apply()
+                        // Use markCallActiveForPhone instead of manual puts
+                        markCallActiveForPhone(applicationContext, markerKey, callId)
                         Log.d(TAG, "Saved callId marker for $markerKey -> $callId (persistAndForwardEvent)")
                     } else {
                         prefs.edit().putString("callid_to_phone_$callId", phoneRaw).apply()
@@ -676,7 +682,15 @@ class CallService : Service() {
         // Persist to queue and forward to Flutter (or buffer)
         persistAndForwardEvent(payload)
 
+        // record last-final meta
         getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putLong(lastFinalKey, timestampMs).putInt(lastDurKey, durationSec ?: -1).apply()
+
+        // Clear transient mapping so subsequent calls get a fresh callId
+        try {
+            clearCallIdMapping(applicationContext, phoneNumber)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to clear callId mapping after finalization: ${e.localizedMessage}")
+        }
     }
 
     fun sendCallEvent(number: String, direction: String, outcome: String, timestamp: Long, durationInSeconds: Int?) {
@@ -745,5 +759,69 @@ class CallService : Service() {
 
     private fun generateCallId(): String {
         return "call_" + java.util.UUID.randomUUID().toString().replace("-", "").take(12)
+    }
+
+    // -----------------------
+    // New helpers for callId lifecycle
+    // -----------------------
+    private fun markCallActiveForPhone(ctx: Context, phoneDigitsOrRaw: String, callId: String) {
+        try {
+            val normalized = normalizeNumber(phoneDigitsOrRaw) ?: phoneDigitsOrRaw
+            val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val now = System.currentTimeMillis()
+            prefs.edit()
+                .putString("callid_$normalized", callId)
+                .putLong("callid_ts_$normalized", now)
+                .putLong("callid_active_until_$normalized", now + ACTIVE_CALL_TTL_MS)
+                .putString("callid_to_phone_$callId", normalized)
+                .apply()
+            Log.d(TAG, "Marked call active for $normalized -> $callId until ${now + ACTIVE_CALL_TTL_MS}")
+        } catch (e: Exception) {
+            Log.w(TAG, "markCallActiveForPhone failed: ${e.localizedMessage}")
+        }
+    }
+
+    private fun readActiveOrRecentCallId(ctx: Context, phoneDigitsOrRaw: String): String? {
+        try {
+            val normalized = normalizeNumber(phoneDigitsOrRaw) ?: phoneDigitsOrRaw
+            val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val id = prefs.getString("callid_$normalized", null) ?: return null
+            val now = System.currentTimeMillis()
+
+            // check explicit active-until marker first
+            val activeUntil = prefs.getLong("callid_active_until_$normalized", 0L)
+            if (activeUntil > now) {
+                Log.d(TAG, "Reusing ACTIVE callId for $normalized -> $id (activeUntil=$activeUntil)")
+                return id
+            }
+
+            // fallback: allow short reuse window if active marker expired but ts is recent
+            val ts = prefs.getLong("callid_ts_$normalized", 0L)
+            if (ts != 0L && (now - ts) <= REUSE_WINDOW_MS) {
+                Log.d(TAG, "Reusing RECENT callId for $normalized -> $id (ts=$ts)")
+                return id
+            }
+
+            // too old / not active
+            return null
+        } catch (e: Exception) {
+            Log.w(TAG, "readActiveOrRecentCallId failed: ${e.localizedMessage}")
+            return null
+        }
+    }
+
+    private fun clearCallIdMapping(ctx: Context, phoneDigitsOrRaw: String) {
+        try {
+            val normalized = normalizeNumber(phoneDigitsOrRaw) ?: phoneDigitsOrRaw
+            val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            prefs.edit()
+                .remove("callid_$normalized")
+                .remove("callid_ts_$normalized")
+                .remove("callid_active_until_$normalized")
+                .apply()
+            Log.d(TAG, "Cleared callId mapping for $normalized")
+        } catch (e: Exception) {
+            Log.w(TAG, "clearCallIdMapping failed: ${e.localizedMessage}")
+        }
     }
 }

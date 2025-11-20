@@ -8,6 +8,11 @@ import androidx.work.WorkerParameters
 class EnqueueEventWorker(appContext: Context, workerParams: WorkerParameters) : Worker(appContext, workerParams) {
     private val TAG = "EnqueueEventWorker"
 
+    // Keep constants in sync with CallService
+    private val PREFS = "call_leads_prefs"
+    private val REUSE_WINDOW_MS = 120_000L            // 2 minutes fallback
+    private val ACTIVE_CALL_TTL_MS = 60 * 60 * 1000L // 1 hour active TTL
+
     override fun doWork(): Result {
         return try {
             val data = inputData
@@ -79,23 +84,45 @@ class EnqueueEventWorker(appContext: Context, workerParams: WorkerParameters) : 
      * Fast lookup: check direct reverse mapping "callid_to_phone_<callId>" first.
      * Fallback: scan legacy "callid_<phone>" keys to find a matching callId.
      *
-     * This version is defensive and tolerates small races by checking direct mapping first
-     * and also scanning legacy keys.
+     * This enhanced version respects the "active" marker (callid_active_until_<phone>)
+     * and a recent-time fallback (callid_ts_<phone>) to avoid returning very old mappings.
      */
     private fun tryFindPhoneForCallId(ctx: Context, callId: String): String? {
         try {
-            val prefs = ctx.getSharedPreferences("call_leads_prefs", Context.MODE_PRIVATE)
+            val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             // direct mapping (fast)
             val direct = prefs.getString("callid_to_phone_$callId", null)
             if (!direct.isNullOrEmpty()) return direct
 
             // fallback: scan keys (backwards compatibility)
             val all = prefs.all
+            val now = System.currentTimeMillis()
+
             for ((k, v) in all) {
-                if (k.startsWith("callid_") && v is String && v == callId) {
-                    val normalized = k.removePrefix("callid_")
+                // Skip helper keys and reverse mappings
+                if (k.startsWith("callid_to_phone_")) continue
+                if (k.startsWith("callid_active_until_")) continue
+                if (k.startsWith("callid_ts_")) continue
+
+                // We're interested in keys like "callid_<normalizedPhone>"
+                if (!k.startsWith("callid_")) continue
+                val value = v as? String ?: continue
+                if (value != callId) continue
+
+                // found a candidate -> check activity/recency
+                val normalized = k.removePrefix("callid_")
+                // prefer active-until marker
+                val activeUntil = prefs.getLong("callid_active_until_$normalized", 0L)
+                if (activeUntil > now) {
+                    // still active
                     return normalized
                 }
+                // fallback to timestamp recency
+                val ts = prefs.getLong("callid_ts_$normalized", 0L)
+                if (ts != 0L && (now - ts) <= REUSE_WINDOW_MS) {
+                    return normalized
+                }
+                // else treat as too old, continue searching (there may be other keys)
             }
         } catch (e: Exception) {
             Log.w(TAG, "Error while looking up callId mapping: ${e.localizedMessage}")
