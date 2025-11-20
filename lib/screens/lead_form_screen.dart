@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import '../models/lead.dart';
 import '../services/lead_service.dart';
 
@@ -22,6 +23,44 @@ class LeadFormScreen extends StatefulWidget {
   State<LeadFormScreen> createState() => _LeadFormScreenState();
 }
 
+// Small model for a call doc (we only require a few fields)
+class LatestCall {
+  final String id;
+  final String? direction;
+  final int? durationInSeconds;
+  final DateTime? createdAt;
+
+  LatestCall({
+    required this.id,
+    this.direction,
+    this.durationInSeconds,
+    this.createdAt,
+  });
+
+  factory LatestCall.fromDoc(QueryDocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>;
+
+    DateTime? _toDate(Object? v) {
+      if (v == null) return null;
+      if (v is Timestamp) return v.toDate();
+      if (v is DateTime) return v;
+      try {
+        return DateTime.parse(v.toString());
+      } catch (_) {
+        return null;
+      }
+    }
+
+    return LatestCall(
+      id: doc.id,
+      direction: (data['direction'] as String?)?.toLowerCase(),
+      durationInSeconds:
+          data['durationInSeconds'] is num ? (data['durationInSeconds'] as num).toInt() : null,
+      createdAt: _toDate(data['createdAt']),
+    );
+  }
+}
+
 class _LeadFormScreenState extends State<LeadFormScreen> {
   final LeadService _service = LeadService.instance;
 
@@ -43,6 +82,10 @@ class _LeadFormScreenState extends State<LeadFormScreen> {
     "closed",
   ];
 
+  // Latest up to 5 calls (fresh from calls subcollection)
+  List<LatestCall> _latestCalls = [];
+  bool _loadingLatestCalls = false;
+
   @override
   void initState() {
     super.initState();
@@ -52,6 +95,9 @@ class _LeadFormScreenState extends State<LeadFormScreen> {
     _phoneController = TextEditingController(text: _lead.phoneNumber);
 
     _nameController.addListener(_checkUnsavedChanges);
+
+    // Load the latest call docs for this lead
+    _loadLatestCalls();
   }
 
   @override
@@ -135,6 +181,9 @@ class _LeadFormScreenState extends State<LeadFormScreen> {
     });
 
     _checkUnsavedChanges();
+
+    // Reload latest calls after save in case backend updated anything
+    await _loadLatestCalls();
   }
 
   Future<void> _addNote() async {
@@ -158,6 +207,8 @@ class _LeadFormScreenState extends State<LeadFormScreen> {
           _phoneController.text = _lead.phoneNumber;
         }
       });
+      // refresh latest calls after adding a note (safe no-op if nothing changed)
+      await _loadLatestCalls();
     } catch (e) {
       print('❌ Error adding note: $e');
     }
@@ -248,44 +299,108 @@ class _LeadFormScreenState extends State<LeadFormScreen> {
     );
   }
 
+  // -------------------------------------------------------------------
+  // NEW: load latest up to 5 call docs from calls subcollection for this lead
+  // -------------------------------------------------------------------
+  Future<void> _loadLatestCalls() async {
+    setState(() {
+      _loadingLatestCalls = true;
+    });
+
+    try {
+      if (_lead.id.isEmpty) {
+        setState(() {
+          _latestCalls = [];
+          _loadingLatestCalls = false;
+        });
+        return;
+      }
+
+      final q = await FirebaseFirestore.instance
+          .collection('leads')
+          .doc(_lead.id)
+          .collection('calls')
+          .orderBy('createdAt', descending: true)
+          .limit(5)
+          .get();
+
+      final list = q.docs.map((d) => LatestCall.fromDoc(d)).toList();
+      setState(() {
+        _latestCalls = list;
+      });
+    } catch (e, st) {
+      print('Error loading latest calls for lead ${_lead.id}: $e\n$st');
+      setState(() {
+        _latestCalls = [];
+      });
+    } finally {
+      setState(() {
+        _loadingLatestCalls = false;
+      });
+    }
+  }
+
+  String? _timeAgo(DateTime? dt) {
+    if (dt == null) return null;
+    final diff = DateTime.now().difference(dt);
+    if (diff.inSeconds < 60) return '${diff.inSeconds}s';
+    if (diff.inMinutes < 60) return '${diff.inMinutes}m';
+    if (diff.inHours < 24) return '${diff.inHours}h';
+    return '${diff.inDays}d';
+  }
+
+  // Replaced: call-history display now uses calls subcollection docs (latest 5)
   Widget _callHistorySection() {
-    if (_lead.callHistory.isEmpty) return const Text("No call history recorded.");
+    if (_loadingLatestCalls) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 8.0),
+        child: SizedBox(height: 28, child: Center(child: CircularProgressIndicator(strokeWidth: 2))),
+      );
+    }
+
+    if (_latestCalls.isEmpty) {
+      return const Text("No recent calls");
+    }
 
     return Column(
-      children: _lead.callHistory.reversed.map((call) {
-        final icon = call.direction == "inbound" ? Icons.call_received : Icons.call_made;
-        final Color color;
-        switch (call.outcome) {
-          case 'answered':
-            color = Colors.green.shade600;
-            break;
-          case 'missed':
-            color = Colors.red.shade600;
-            break;
-          case 'rejected':
-            color = Colors.orange.shade600;
-            break;
-          case 'ended':
-            color = Colors.blueGrey.shade400;
-            break;
-          default:
-            color = Colors.blue.shade600;
-        }
+      children: _latestCalls.map((c) {
+        final icon = (c.direction == "inbound") ? Icons.call_received : Icons.call_made;
+        final dirLabel = (c.direction ?? '').toUpperCase();
+        final durLabel = c.durationInSeconds != null ? _formatDuration(c.durationInSeconds!) : '-';
+        final when = _timeAgo(c.createdAt) ?? '-';
 
-        final durationText = call.durationInSeconds != null ? ' (${_formatDuration(call.durationInSeconds!)})' : '';
+        // subtle color coding for inbound/outbound
+        final Color bgColor = (c.direction == 'inbound') ? Colors.blue.shade50 : Colors.purple.shade50;
+        final Color borderColor = (c.direction == 'inbound') ? Colors.blue.shade100 : Colors.purple.shade100;
+        final Color textColor = Colors.black87;
 
         return Padding(
           padding: const EdgeInsets.only(bottom: 8.0),
           child: Container(
             decoration: BoxDecoration(
-              color: color.withOpacity(0.08),
+              color: bgColor,
               borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: color.withOpacity(0.2)),
+              border: Border.all(color: borderColor),
             ),
             child: ListTile(
-              leading: Icon(icon, color: color),
-              title: Text("${call.direction} – ${call.outcome.toUpperCase()}$durationText", style: TextStyle(fontWeight: FontWeight.w600, color: color)),
-              subtitle: Text(_formatDate(call.timestamp), style: const TextStyle(fontSize: 12)),
+              leading: Icon(icon, color: textColor),
+              title: Row(
+                children: [
+                  Text(dirLabel, style: TextStyle(fontWeight: FontWeight.w700, color: textColor)),
+                  const SizedBox(width: 12),
+                  Text(durLabel, style: TextStyle(color: textColor)),
+                ],
+              ),
+              subtitle: Text(when, style: const TextStyle(fontSize: 12, color: Colors.black54)),
+              trailing: IconButton(
+                icon: const Icon(Icons.chevron_right, size: 20, color: Colors.grey),
+                onPressed: () async {
+                  // optional: expand to show full details or open call doc
+                  // For now, refresh list to pull newest data
+                  await _loadLatestCalls();
+                },
+                tooltip: 'Refresh calls',
+              ),
             ),
           ),
         );

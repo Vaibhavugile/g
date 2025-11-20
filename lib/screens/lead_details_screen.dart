@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import '../models/lead.dart';
 import '../services/lead_service.dart';
 
@@ -12,6 +13,43 @@ class LeadDetailsScreen extends StatefulWidget {
 
   @override
   State<LeadDetailsScreen> createState() => _LeadDetailsScreenState();
+}
+
+class LatestCall {
+  final String id;
+  final String? direction;
+  final int? durationInSeconds;
+  final DateTime? createdAt;
+
+  LatestCall({
+    required this.id,
+    this.direction,
+    this.durationInSeconds,
+    this.createdAt,
+  });
+
+  factory LatestCall.fromDoc(QueryDocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>;
+
+    DateTime? _toDate(Object? v) {
+      if (v == null) return null;
+      if (v is Timestamp) return v.toDate();
+      if (v is DateTime) return v;
+      try {
+        return DateTime.parse(v.toString());
+      } catch (_) {
+        return null;
+      }
+    }
+
+    return LatestCall(
+      id: doc.id,
+      direction: (data['direction'] as String?)?.toLowerCase(),
+      durationInSeconds:
+          data['durationInSeconds'] is num ? (data['durationInSeconds'] as num).toInt() : null,
+      createdAt: _toDate(data['createdAt']),
+    );
+  }
 }
 
 class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
@@ -33,6 +71,10 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
     "closed",
   ];
 
+  // Latest up to 5 calls for this lead
+  List<LatestCall> _latestCalls = [];
+  bool _loadingLatestCalls = false;
+
   @override
   void initState() {
     super.initState();
@@ -40,6 +82,8 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
     _phoneController = TextEditingController(text: _lead.phoneNumber);
     _nameController = TextEditingController(text: _lead.name);
     _noteController = TextEditingController();
+
+    _loadLatestCalls();
   }
 
   @override
@@ -52,6 +96,7 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
         _phoneController.text = _lead.phoneNumber;
         _nameController.text = _lead.name;
       });
+      _loadLatestCalls();
     }
   }
 
@@ -110,6 +155,9 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
           _phoneController.text = _lead.phoneNumber;
         }
       });
+
+      // refresh latest calls after adding a note
+      await _loadLatestCalls();
     } catch (e) {
       print('❌ Error adding note: $e');
       ScaffoldMessenger.of(context).showSnackBar(
@@ -158,8 +206,7 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
                 CircleAvatar(
                   radius: 28,
                   backgroundColor: Colors.blue.shade100,
-                  child: Icon(Icons.phone_android,
-                      size: 28, color: Colors.blue.shade700),
+                  child: Icon(Icons.phone_android, size: 28, color: Colors.blue.shade700),
                 ),
                 const SizedBox(width: 16),
                 Expanded(
@@ -190,29 +237,90 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
     );
   }
 
+  // -------------------------
+  // Load latest up to 5 calls
+  // -------------------------
+  Future<void> _loadLatestCalls() async {
+    setState(() {
+      _loadingLatestCalls = true;
+    });
+
+    try {
+      if (_lead.id.isEmpty) {
+        setState(() {
+          _latestCalls = [];
+          _loadingLatestCalls = false;
+        });
+        return;
+      }
+
+      final q = await FirebaseFirestore.instance
+          .collection('leads')
+          .doc(_lead.id)
+          .collection('calls')
+          .orderBy('createdAt', descending: true)
+          .limit(5)
+          .get();
+
+      final list = q.docs.map((d) => LatestCall.fromDoc(d)).toList();
+      setState(() {
+        _latestCalls = list;
+      });
+    } catch (e, st) {
+      print('Error loading latest calls for lead ${_lead.id}: $e\n$st');
+      setState(() {
+        _latestCalls = [];
+      });
+    } finally {
+      setState(() {
+        _loadingLatestCalls = false;
+      });
+    }
+  }
+
+  String? _timeAgo(DateTime? dt) {
+    if (dt == null) return null;
+    final diff = DateTime.now().difference(dt);
+    if (diff.inSeconds < 60) return '${diff.inSeconds}s';
+    if (diff.inMinutes < 60) return '${diff.inMinutes}m';
+    if (diff.inHours < 24) return '${diff.inHours}h';
+    return '${diff.inDays}d';
+  }
+
+  // Replaces the old callHistory UI — shows latest up to 5 calls from calls subcollection
   Widget _callHistorySection() {
-    if (_lead.callHistory.isEmpty) {
+    if (_loadingLatestCalls) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 8.0),
+        child: SizedBox(height: 28, child: Center(child: CircularProgressIndicator(strokeWidth: 2))),
+      );
+    }
+
+    if (_latestCalls.isEmpty) {
       return const Text("No call history yet.");
     }
 
     return Column(
-      children: _lead.callHistory.reversed.map((call) {
+      children: _latestCalls.map((call) {
         final icon = call.direction == "inbound" ? Icons.call_received : Icons.call_made;
-        final color = call.outcome == "answered" ? Colors.green :
-                      call.outcome == "missed" ? Colors.red :
-                      call.outcome == "rejected" ? Colors.orange :
-                      Colors.blue;
-
-        final durationText = call.durationInSeconds != null
-            ? ' (${_formatDuration(call.durationInSeconds!)})'
-            : '';
+        final color = call.direction == "inbound" ? Colors.blue.shade700 : Colors.purple.shade700;
+        final durationText = call.durationInSeconds != null ? ' (${_formatDuration(call.durationInSeconds!)})' : '';
+        final when = _timeAgo(call.createdAt) ?? _formatDate(call.createdAt ?? DateTime.now());
 
         return Card(
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
           child: ListTile(
             leading: Icon(icon, color: color),
-            title: Text("${call.direction} – ${call.outcome.toUpperCase()}$durationText"),
-            subtitle: Text(_formatDate(call.timestamp)),
+            title: Text("${call.direction?.toUpperCase() ?? 'UNKNOWN'}$durationText",
+                style: TextStyle(fontWeight: FontWeight.w600, color: color)),
+            subtitle: Text(when),
+            trailing: IconButton(
+              icon: const Icon(Icons.chevron_right),
+              onPressed: () async {
+                // Optional: open call doc, currently refreshes the list
+                await _loadLatestCalls();
+              },
+            ),
           ),
         );
       }).toList(),
