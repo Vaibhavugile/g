@@ -16,7 +16,6 @@ class MyInCallService : InCallService() {
         override fun onStateChanged(call: Call, state: Int) {
             super.onStateChanged(call, state)
             Log.d(TAG, "onStateChanged: state=$state handle=${call.details?.handle}")
-            // Optionally forward relevant events to CallService or a MethodChannel
         }
 
         override fun onDetailsChanged(call: Call, details: Call.Details?) {
@@ -41,14 +40,26 @@ class MyInCallService : InCallService() {
             val normalized = phone?.filter { it.isDigit() } ?: phone
 
             val callId = generateCallId()
-            // persist marker
+            // persist marker and reverse mapping
             if (!normalized.isNullOrEmpty()) {
                 try {
                     val prefs = applicationContext.getSharedPreferences("call_leads_prefs", Context.MODE_PRIVATE)
-                    prefs.edit().putString("callid_$normalized", callId).putLong("callid_ts_$normalized", System.currentTimeMillis()).apply()
+                    prefs.edit()
+                        .putString("callid_$normalized", callId)
+                        .putLong("callid_ts_$normalized", System.currentTimeMillis())
+                        .putString("callid_to_phone_$callId", normalized)
+                        .apply()
                     Log.d(TAG, "Persisted callId marker from InCallService for $normalized -> $callId")
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed to persist callId marker from InCallService: ${e.localizedMessage}")
+                }
+            } else {
+                try {
+                    val prefs = applicationContext.getSharedPreferences("call_leads_prefs", Context.MODE_PRIVATE)
+                    prefs.edit().putString("callid_to_phone_$callId", phone).apply()
+                    Log.d(TAG, "Persisted reverse mapping from InCallService for callId=$callId -> rawPhone=$phone")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to persist reverse mapping from InCallService: ${e.localizedMessage}")
                 }
             }
 
@@ -88,6 +99,15 @@ class MyInCallService : InCallService() {
 
             val prefs = applicationContext.getSharedPreferences("call_leads_prefs", Context.MODE_PRIVATE)
             val callId = if (!normalized.isNullOrEmpty()) prefs.getString("callid_$normalized", null) else null
+
+            // ensure reverse mapping exists for callId
+            if (!callId.isNullOrEmpty() && !normalized.isNullOrEmpty()) {
+                try {
+                    prefs.edit().putString("callid_to_phone_$callId", normalized).apply()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to ensure reverse mapping on callRemoved: ${e.localizedMessage}")
+                }
+            }
 
             val intent = Intent(applicationContext, CallService::class.java).apply {
                 putExtra("event", "ended")

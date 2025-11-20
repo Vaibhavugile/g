@@ -25,7 +25,6 @@ import androidx.work.WorkManager
 import io.flutter.plugin.common.EventChannel
 import kotlin.math.abs
 import java.util.ArrayDeque
-import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 class CallService : Service() {
@@ -107,7 +106,6 @@ class CallService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var currentCallNumber: String? = null
     private var currentCallDirection: String? = null
-    private var currentCallId: String? = null
     private var previousCallState: Int = TelephonyManager.CALL_STATE_IDLE
     private var lastCallEndTime: Long = 0
     private var legacyListener: CallStateListener? = null
@@ -124,17 +122,10 @@ class CallService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(TAG, "➡️ onStartCommand extras=${intent?.extras}")
-
-        // Ensure callbacks are registered (idempotent)
-        try {
-            registerTelephonyCallback()
-        } catch (e: Exception) {
-            Log.w(TAG, "registerTelephonyCallback in onStartCommand failed: ${e.localizedMessage}")
-        }
-
         val event = intent?.getStringExtra("event")
         val number = intent?.getStringExtra("phoneNumber")
         val direction = intent?.getStringExtra("direction")
+        val callIdFromIntent = intent?.getStringExtra("callId")
 
         if (event == "ended") {
             Log.d(TAG, "Received 'ended' intent — deferring final result to call log (numberOverride=$number).")
@@ -153,19 +144,13 @@ class CallService : Service() {
             }
 
             if (event == "outgoing_start") {
-                // ensure we have a callId for outbound
-                if (currentCallId == null) {
-                    currentCallId = generateCallId(System.currentTimeMillis())
-                    saveCallIdMarker(normalizeNumber(number) ?: number, currentCallId!!)
-                    Log.d(TAG, "Created currentCallId=$currentCallId for outbound number=$number")
-                }
                 val payload = mapOf<String, Any?>(
                     "phoneNumber" to number,
                     "direction" to "outbound",
                     "outcome" to "outgoing_start",
                     "timestamp" to System.currentTimeMillis(),
                     "durationInSeconds" to null,
-                    "callId" to currentCallId
+                    "callId" to callIdFromIntent
                 )
                 Log.d(TAG, "DEBUG: Immediate forward outbound -> $payload")
                 // Persist & forward
@@ -237,13 +222,59 @@ class CallService : Service() {
     /**
      * Persist event to on-device queue and attempt to forward to Flutter.
      * Also schedules WorkManager UploadWorker to ensure eventual upload to Firestore.
+     *
+     * Small change: if the payload doesn't include a callId, generate one and persist both
+     * callid_<phone> and callid_to_phone_<callId> for fast reverse lookup by EnqueueEventWorker.
      */
     private fun persistAndForwardEvent(payload: Map<String, Any?>) {
         try {
+            // Make a mutable copy so we can enrich it
+            val mutable = payload.toMutableMap()
+
+            // Ensure phone normalized
+            val phoneRaw = (mutable["phoneNumber"] as? String)
+            val normalizedPhone = normalizeNumber(phoneRaw) ?: phoneRaw
+
+            // If callId missing, generate and save mapping
+            var callId = mutable["callId"] as? String
+            if (callId.isNullOrEmpty()) {
+                callId = generateCallId()
+                mutable["callId"] = callId
+                try {
+                    val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                    val markerKey = if (!normalizedPhone.isNullOrEmpty()) normalizedPhone else (phoneRaw ?: "")
+                    if (markerKey.isNotEmpty()) {
+                        prefs.edit()
+                            .putString("callid_$markerKey", callId)
+                            .putLong("callid_ts_$markerKey", System.currentTimeMillis())
+                            .putString("callid_to_phone_$callId", markerKey)
+                            .apply()
+                        Log.d(TAG, "Saved callId marker for $markerKey -> $callId (persistAndForwardEvent)")
+                    } else {
+                        prefs.edit().putString("callid_to_phone_$callId", phoneRaw).apply()
+                        Log.d(TAG, "Saved reverse callId mapping only for callId=$callId")
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed saving callId marker in persistAndForwardEvent: ${e.localizedMessage}")
+                }
+            } else {
+                // If callId present, ensure reverse mapping exists
+                try {
+                    val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                    val existing = prefs.getString("callid_to_phone_$callId", null)
+                    if (existing.isNullOrEmpty() && !normalizedPhone.isNullOrEmpty()) {
+                        prefs.edit().putString("callid_to_phone_$callId", normalizedPhone).apply()
+                        Log.d(TAG, "Backfilled reverse mapping for callId=$callId -> $normalizedPhone")
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed ensuring reverse mapping exists: ${e.localizedMessage}")
+                }
+            }
+
             // Persist to EventQueue (durable)
             val q = EventQueue(applicationContext)
-            q.enqueue(payload)
-            Log.d(TAG, "Persisted event to EventQueue. queueSize=${q.size()} payload=$payload")
+            q.enqueue(mutable)
+            Log.d(TAG, "Persisted event to EventQueue. queueSize=${q.size()} payload=$mutable")
 
             // Schedule WorkManager upload (ensures eventual delivery)
             val workRequest = OneTimeWorkRequestBuilder<UploadWorker>()
@@ -258,7 +289,7 @@ class CallService : Service() {
             WorkManager.getInstance(applicationContext).enqueue(workRequest)
 
             // Forward to Flutter if connected; otherwise buffer in-memory for flush later
-            sendToFlutterOrBuffer(payload)
+            sendToFlutterOrBuffer(mutable)
         } catch (e: Exception) {
             Log.e(TAG, "Error persisting/forwarding event: ${e.localizedMessage}", e)
             // Still attempt to buffer for UI
@@ -344,10 +375,8 @@ class CallService : Service() {
                 } else if (previousCallState == TelephonyManager.CALL_STATE_RINGING) {
                     handleCallEndedAfterRinging(incomingNumber)
                 }
-                // clear volatile runtime fields; callId marker persisted until finalization
                 currentCallNumber = null
                 currentCallDirection = null
-                currentCallId = null
                 lastCallEndTime = System.currentTimeMillis()
             }
 
@@ -355,25 +384,6 @@ class CallService : Service() {
                 Log.d(TAG, "RINGING event via listener.")
                 if (currentCallDirection == null) currentCallDirection = "inbound"
                 if (currentCallNumber == null && !incomingNumber.isNullOrEmpty()) currentCallNumber = incomingNumber
-
-                // Create a callId for this call if not already present
-                if (currentCallId == null) {
-                    val ts = System.currentTimeMillis()
-                    currentCallId = generateCallId(ts)
-                    val normalized = normalizeNumber(currentCallNumber) ?: currentCallNumber ?: ""
-                    if (normalized.isNotEmpty()) saveCallIdMarker(normalized, currentCallId!!)
-                    Log.d(TAG, "Created currentCallId=$currentCallId for number=${currentCallNumber}")
-                    // Emit a 'ringing' event to ensure a call doc is created ASAP
-                    val payload = mapOf<String, Any?>(
-                        "phoneNumber" to (currentCallNumber ?: incomingNumber ?: "unknown"),
-                        "direction" to (currentCallDirection ?: "inbound"),
-                        "outcome" to "ringing",
-                        "timestamp" to ts,
-                        "durationInSeconds" to null,
-                        "callId" to currentCallId
-                    )
-                    persistAndForwardEvent(payload)
-                }
             }
         }
 
@@ -601,9 +611,6 @@ class CallService : Service() {
             outgoingMarker?.first?.let { numbersLikelyMatch(it, phoneNumber) } ?: false
         }
 
-        // Try to obtain callId: prefer currentCallId, otherwise read persisted marker
-        val resolvedCallId = currentCallId ?: readCallIdMarker(normalized)
-
         val lastFinalKey = "last_final_ts_$normalized"
         val lastFinalTs = getSharedPreferences(PREFS, Context.MODE_PRIVATE).getLong(lastFinalKey, 0L)
         val lastDurKey = "last_final_dur_$normalized"
@@ -616,7 +623,7 @@ class CallService : Service() {
             }
         }
 
-        val payload = mutableMapOf<String, Any?>(
+        val payload = mapOf(
             "phoneNumber" to phoneNumber,
             "direction" to if (isOutbound) "outbound" else "inbound",
             "outcome" to finalOutcome,
@@ -624,35 +631,21 @@ class CallService : Service() {
             "durationInSeconds" to durationSec
         )
 
-        if (!resolvedCallId.isNullOrEmpty()) {
-            payload["callId"] = resolvedCallId
-        }
-
         Log.d(TAG, "📤 Emitting final event: $payload")
         // Persist to queue and forward to Flutter (or buffer)
         persistAndForwardEvent(payload)
-
-        // cleanup persisted callId marker for this number — finalization done
-        if (!resolvedCallId.isNullOrEmpty()) {
-            removeCallIdMarker(normalized)
-        }
 
         getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putLong(lastFinalKey, timestampMs).putInt(lastDurKey, durationSec ?: -1).apply()
     }
 
     fun sendCallEvent(number: String, direction: String, outcome: String, timestamp: Long, durationInSeconds: Int?) {
-        val data = mutableMapOf<String, Any?>(
+        val data = mapOf(
             "phoneNumber" to number,
             "direction" to direction,
             "outcome" to outcome,
             "timestamp" to timestamp,
-            "durationInSeconds" to durationInSeconds
+            "durationInSeconds" to durationInSeconds,
         )
-        // include callId if available (runtime or persisted)
-        val normalized = normalizeNumber(number)
-        val resolvedCallId = currentCallId ?: (if (normalized != null) readCallIdMarker(normalized) else null)
-        if (!resolvedCallId.isNullOrEmpty()) data["callId"] = resolvedCallId
-
         Log.d(TAG, "📤 Sending event to Flutter (and persisting): $data")
         persistAndForwardEvent(data)
     }
@@ -663,32 +656,6 @@ class CallService : Service() {
         val ts = prefs.getLong(KEY_LAST_OUTGOING_TS, 0L)
         if (num == null || ts == 0L) return null
         return Pair(num, ts)
-    }
-
-    private fun saveCallIdMarker(phoneDigitsOrRaw: String?, callId: String) {
-        try {
-            val normalized = normalizeNumber(phoneDigitsOrRaw) ?: phoneDigitsOrRaw
-            if (normalized.isNullOrEmpty()) return
-            val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            prefs.edit().putString("callid_$normalized", callId).apply()
-            prefs.edit().putLong("callid_ts_$normalized", System.currentTimeMillis()).apply()
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to save callId marker: ${e.localizedMessage}")
-        }
-    }
-
-    private fun readCallIdMarker(phoneDigitsOrRaw: String?): String? {
-        if (phoneDigitsOrRaw.isNullOrEmpty()) return null
-        val normalized = normalizeNumber(phoneDigitsOrRaw) ?: phoneDigitsOrRaw
-        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        return prefs.getString("callid_$normalized", null)
-    }
-
-    private fun removeCallIdMarker(phoneDigitsOrRaw: String?) {
-        if (phoneDigitsOrRaw.isNullOrEmpty()) return
-        val normalized = normalizeNumber(phoneDigitsOrRaw) ?: phoneDigitsOrRaw
-        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        prefs.edit().remove("callid_$normalized").remove("callid_ts_$normalized").apply()
     }
 
     private fun buildNotification(): Notification {
@@ -735,11 +702,7 @@ class CallService : Service() {
         }
     }
 
-    // -----------------------
-    // callId helper
-    // -----------------------
-    private fun generateCallId(ts: Long = System.currentTimeMillis()): String {
-        val short = UUID.randomUUID().toString().replace("-", "").take(8)
-        return "call_${ts}_$short"
+    private fun generateCallId(): String {
+        return "call_" + java.util.UUID.randomUUID().toString().replace("-", "").take(12)
     }
 }

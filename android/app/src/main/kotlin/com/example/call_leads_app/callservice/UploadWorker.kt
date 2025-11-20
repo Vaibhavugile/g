@@ -21,6 +21,7 @@ import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
 import kotlin.random.Random
+import com.google.firebase.firestore.Query
 
 /**
  * UploadWorker: reads queued events from EventQueue, and writes them into Firestore using the
@@ -35,11 +36,14 @@ import kotlin.random.Random
  *  - Commits in conservative chunks (well under Firestore limits).
  *  - Removes only the contiguous prefix of queued items that were actually uploaded,
  *    preventing accidental deletion of later items when some early items were skipped.
+ *  - If an item lacks callId, attempt to find an existing "open" call doc for the lead (most recent,
+ *    not finalized) and attach the event to it. If none found, generate a callId.
  */
 class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWorker(appContext, params) {
 
     private val TAG = "UploadWorker"
     private val queue = EventQueue(appContext)
+    private val PREFS = "call_leads_prefs"
 
     override suspend fun doWork(): Result {
         try {
@@ -87,7 +91,6 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                 val leadData: Map<String, Any?>,
                 val callPath: String,
                 val callBase: Map<String, Any?>,
-                val eventPath: String,
                 val eventData: Map<String, Any?>,
                 val finalizeFields: Map<String, Any?>?
             )
@@ -114,12 +117,17 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                         else -> null
                     }
                     val callIdFromEvent = (item["callId"] as? String)
-                    val callId = callIdFromEvent ?: generateCallId(ts)
-
+                    // If callId missing, try to find an open call doc for this phone; else generate one
                     val leadId = leadIdFromPhone(phone)
+                    val callId = if (!callIdFromEvent.isNullOrEmpty()) {
+                        callIdFromEvent
+                    } else {
+                        // BEST-EFFORT: query recent calls for this lead and reuse an open one
+                        findOpenCallIdForLeadOrGenerate(firestore, leadId, phone, ts)
+                    }
+
                     val leadRefPath = "leads/$leadId"
                     val callRefPath = "$leadRefPath/calls/$callId"
-                    val eventRefPath = "$callRefPath/events/${firestore.collection("_temp").document().id}" // temp id; will be used as path
 
                     val leadUpsert = mapOf(
                         "phoneNumber" to phone,
@@ -135,12 +143,13 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                     val eventData = mutableMapOf<String, Any?>(
                         "outcome" to outcome,
                         "timestamp" to ts,
-                        "receivedAt" to (item["receivedAt"] ?: FieldValue.serverTimestamp())
+                        "receivedAt" to (item["receivedAt"] ?: FieldValue.serverTimestamp()),
+                        "callId" to callId
                     )
                     if (duration != null) eventData["durationInSeconds"] = duration
                     if (callIdFromEvent == null) {
-                        // if worker generated callId, record it in event for traceability
-                        eventData["callIdGenerated"] = callId
+                        // if worker generated or selected callId, record that for traceability
+                        eventData["callIdGeneratedByWorker"] = true
                     }
 
                     val isFinal = (outcome == "ended" || duration != null)
@@ -160,7 +169,6 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                             leadData = leadUpsert,
                             callPath = callRefPath,
                             callBase = callBase,
-                            eventPath = eventRefPath,
                             eventData = eventData,
                             finalizeFields = finalizeFields
                         )
@@ -298,5 +306,41 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
         } catch (e: Exception) {
             input.take(24) // fallback
         }
+    }
+
+    /**
+     * Best-effort: find a recent open call doc for the given lead+phone.
+     * Queries the calls subcollection for the lead ordered by createdAt descending,
+     * then picks the first doc that appears not-finalized (no finalizedAt / no finalOutcome).
+     * If query fails or nothing suitable is found, returns a generated callId.
+     */
+    private suspend fun findOpenCallIdForLeadOrGenerate(firestore: FirebaseFirestore, leadId: String, phone: String, ts: Long): String {
+        try {
+            val callsRef = firestore.collection("leads").document(leadId).collection("calls")
+            // Query most recent calls for this phone. (Order and limit is lightweight.)
+            val qSnap = callsRef
+    .whereEqualTo("phoneNumber", phone)
+    .orderBy("createdAt", Query.Direction.DESCENDING)
+    .limit(5)
+    .get()
+    .await()
+
+            if (!qSnap.isEmpty) {
+                for (doc in qSnap.documents) {
+                    val finalizedAt = doc.get("finalizedAt")
+                    val finalOutcome = doc.get("finalOutcome")
+                    if (finalizedAt == null && finalOutcome == null) {
+                        Log.d(TAG, "Reusing open call doc ${doc.id} for phone=$phone")
+                        return doc.id
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            // Query could fail on missing index or network; fallback to generate
+            Log.w(TAG, "Open-call lookup failed for lead=$leadId phone=$phone : ${e.localizedMessage}")
+        }
+        val gen = generateCallId(ts)
+        Log.d(TAG, "No open call found; generated callId=$gen for phone=$phone")
+        return gen
     }
 }

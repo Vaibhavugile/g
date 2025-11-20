@@ -1,9 +1,7 @@
 package com.example.call_leads_app.callservice
 
 import android.content.Intent
-import android.content.Context
 import android.net.Uri
-import android.os.Build
 import android.telecom.CallRedirectionService
 import android.telecom.PhoneAccountHandle
 import android.util.Log
@@ -24,7 +22,7 @@ class MyCallRedirectionService : CallRedirectionService() {
             val phoneNumber = handle.schemeSpecificPart
             Log.d(TAG, "onPlaceCall: $phoneNumber")
 
-            val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
             prefs.edit()
                 .putString(KEY_LAST_OUTGOING, phoneNumber)
                 .putLong(KEY_LAST_OUTGOING_TS, System.currentTimeMillis())
@@ -38,8 +36,18 @@ class MyCallRedirectionService : CallRedirectionService() {
             // persist callId marker for later retrieval by CallService or IncomingReceiver
             try {
                 if (!normalized.isNullOrEmpty()) {
-                    prefs.edit().putString("callid_$normalized", callId).putLong("callid_ts_$normalized", System.currentTimeMillis()).apply()
-                    Log.d(TAG, "Saved callId marker for $normalized -> $callId")
+                    prefs.edit()
+                        .putString("callid_$normalized", callId)
+                        .putLong("callid_ts_$normalized", System.currentTimeMillis())
+                        .putString("callid_to_phone_$callId", normalized) // <-- reverse mapping
+                        .apply()
+                    Log.d(TAG, "Saved callId marker for $normalized -> $callId (and reverse mapping)")
+                } else {
+                    // still save reverse mapping keyed by raw phone if normalized empty
+                    prefs.edit()
+                        .putString("callid_to_phone_$callId", phoneNumber)
+                        .apply()
+                    Log.d(TAG, "Saved reverse mapping for callId=$callId -> rawPhone=$phoneNumber")
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Failed saving callId marker: ${e.localizedMessage}")

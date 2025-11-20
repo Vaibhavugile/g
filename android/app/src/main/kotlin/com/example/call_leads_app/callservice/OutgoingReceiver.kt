@@ -36,7 +36,6 @@ class OutgoingReceiver : BroadcastReceiver() {
         if (normalized.isNullOrEmpty()) {
             Log.w(TAG, "Normalized outgoing number empty after cleanup. Using raw number instead.")
         } else {
-            // Persist normalized outgoing marker with timestamp for IncomingReceiver to detect
             try {
                 val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 prefs.edit().putString(KEY_LAST_OUTGOING, normalized).putLong(KEY_LAST_OUTGOING_TS, System.currentTimeMillis()).apply()
@@ -51,8 +50,12 @@ class OutgoingReceiver : BroadcastReceiver() {
         try {
             val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             val markerKey = if (!normalized.isNullOrEmpty()) normalized else number
-            prefs.edit().putString("callid_$markerKey", callId).putLong("callid_ts_$markerKey", System.currentTimeMillis()).apply()
-            Log.d(TAG, "Saved callId marker for $markerKey -> $callId")
+            prefs.edit()
+                .putString("callid_$markerKey", callId)
+                .putLong("callid_ts_$markerKey", System.currentTimeMillis())
+                .putString("callid_to_phone_$callId", markerKey)
+                .apply()
+            Log.d(TAG, "Saved callId marker for $markerKey -> $callId (and reverse mapping)")
         } catch (e: Exception) {
             Log.w(TAG, "Failed saving callId marker: ${e.localizedMessage}")
         }

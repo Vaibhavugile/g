@@ -16,7 +16,7 @@ class EnqueueEventWorker(appContext: Context, workerParams: WorkerParameters) : 
                 eventMap[k] = v
             }
 
-            // Ensure phoneNumber is normalized if available
+            // Normalize phoneNumber if present (digits-only)
             val phoneRaw = eventMap["phoneNumber"] as? String
             val normalized = phoneRaw?.filter { it.isDigit() }
             if (!normalized.isNullOrEmpty()) {
@@ -32,7 +32,9 @@ class EnqueueEventWorker(appContext: Context, workerParams: WorkerParameters) : 
                 if (!callId.isNullOrEmpty()) {
                     val recovered = tryFindPhoneForCallId(applicationContext, callId)
                     if (!recovered.isNullOrEmpty()) {
-                        eventMap["phoneNumber"] = recovered
+                        // ensure we store digits-only phone
+                        val recoveredNorm = recovered.filter { it.isDigit() }
+                        eventMap["phoneNumber"] = if (recoveredNorm.isNotEmpty()) recoveredNorm else recovered
                         Log.d(TAG, "Recovered phoneNumber=$recovered for callId=$callId")
                     } else {
                         Log.w(TAG, "No phone mapping found for callId=$callId; will enqueue without phone (UploadWorker may skip).")
@@ -60,23 +62,28 @@ class EnqueueEventWorker(appContext: Context, workerParams: WorkerParameters) : 
         }
     }
 
-    // Try to find a phone number that was previously saved as "callid_<normalized>" -> callId
+    /**
+     * Fast lookup: check direct reverse mapping "callid_to_phone_<callId>" first.
+     * Fallback: scan legacy "callid_<phone>" keys to find a matching callId.
+     */
     private fun tryFindPhoneForCallId(ctx: Context, callId: String): String? {
-        return try {
+        try {
             val prefs = ctx.getSharedPreferences("call_leads_prefs", Context.MODE_PRIVATE)
+            // direct mapping (fast)
+            val direct = prefs.getString("callid_to_phone_$callId", null)
+            if (!direct.isNullOrEmpty()) return direct
+
+            // fallback: scan keys (backwards compatibility)
             val all = prefs.all
-            // Keys we wrote are like "callid_<normalized>" -> callId
             for ((k, v) in all) {
                 if (k.startsWith("callid_") && v is String && v == callId) {
-                    // extract normalized phone part from key
                     val normalized = k.removePrefix("callid_")
                     return normalized
                 }
             }
-            null
         } catch (e: Exception) {
-            Log.w(TAG, "Error while scanning prefs for callId mapping: ${e.localizedMessage}")
-            null
+            Log.w(TAG, "Error while looking up callId mapping: ${e.localizedMessage}")
         }
+        return null
     }
 }
