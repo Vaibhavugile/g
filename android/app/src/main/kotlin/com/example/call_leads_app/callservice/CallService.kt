@@ -264,6 +264,23 @@ class CallService : Service() {
             // Make a mutable copy so we can enrich it
             val mutable = payload.toMutableMap()
 
+            // --- NEW: attach tenantId from SharedPreferences (if present) ---
+            try {
+                val prefsLocal = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                val tenantId = prefsLocal.getString("tenantId", null)
+                if (!tenantId.isNullOrEmpty()) {
+                    mutable["tenantId"] = tenantId
+                    Log.d(TAG, "Attached tenantId=$tenantId to event for phone=${mutable["phoneNumber"]}")
+                } else {
+                    // defensive: mark event for review later if no tenant set (helps migration/debug)
+                    mutable["needsTenantReview"] = true
+                    Log.w(TAG, "No tenantId in prefs – event marked needsTenantReview for phone=${mutable["phoneNumber"]}")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Error while reading tenantId from prefs: ${e.localizedMessage}")
+            }
+            // --- END tenant attach ---
+
             // Ensure phone normalized
             val phoneRaw = (mutable["phoneNumber"] as? String)
             val normalizedPhone = normalizeNumber(phoneRaw) ?: phoneRaw

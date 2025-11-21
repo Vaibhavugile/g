@@ -54,12 +54,21 @@ class MyInCallService : InCallService() {
                 Log.d(TAG, "Persisted callId marker from InCallService for ${normalized ?: phone} -> $callId")
             }
 
+            // read tenantId from prefs (if present) and attach to intent
+            val tenant = try {
+                applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("tenantId", null)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed reading tenantId from prefs: ${e.localizedMessage}")
+                null
+            }
+
             val intent = Intent(applicationContext, CallService::class.java).apply {
                 putExtra("event", "ringing")
                 putExtra("direction", "inbound")
                 putExtra("phoneNumber", normalized ?: phone)
                 putExtra("callId", callId)
                 putExtra("receivedAt", System.currentTimeMillis())
+                tenant?.let { putExtra("tenantId", it) }
             }
             // try start service (defensive - may fail in some contexts)
             try {
@@ -107,12 +116,21 @@ class MyInCallService : InCallService() {
                 }
             }
 
+            // read tenantId from prefs (if present) and attach to intent
+            val tenant = try {
+                applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("tenantId", null)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed reading tenantId from prefs: ${e.localizedMessage}")
+                null
+            }
+
             val intent = Intent(applicationContext, CallService::class.java).apply {
                 putExtra("event", "ended")
                 putExtra("direction", "inbound")
                 putExtra("phoneNumber", normalized ?: phone)
                 if (!callId.isNullOrEmpty()) putExtra("callId", callId)
                 putExtra("receivedAt", System.currentTimeMillis())
+                tenant?.let { putExtra("tenantId", it) }
             }
             try {
                 ContextCompat.startForegroundService(applicationContext, intent)
@@ -135,7 +153,7 @@ class MyInCallService : InCallService() {
     }
 
     // -----------------------
-    // CallId lifecycle helpers (active + recent semantics)
+    // CallId lifecycle helpers (active & recent semantics)
     // -----------------------
     private fun markCallActiveForPhone(ctx: Context, phoneDigitsOrRaw: String, callId: String) {
         try {

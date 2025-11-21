@@ -50,6 +50,13 @@ class IncomingReceiver : BroadcastReceiver() {
             // normalize incoming early
             val normalizedIncoming = normalizeNumber(incomingNumber)
 
+            // read tenant once and attach to intents
+            val tenantId = try {
+                prefs.getString("tenantId", null)
+            } catch (e: Exception) {
+                null
+            }
+
             if (isRecentOutgoing && normalizedIncoming != null) {
                 if (numbersLikelyMatch(lastOutgoing, normalizedIncoming)) {
                     Log.d(TAG, "ℹ️ Detected recent outgoing marker for $normalizedIncoming — treating as outbound and clearing marker.")
@@ -68,6 +75,8 @@ class IncomingReceiver : BroadcastReceiver() {
                         putExtra("phoneNumber", normalizedIncoming)
                         putExtra("callId", callId)
                         putExtra("receivedAt", now)
+                        // attach tenant if present
+                        tenantId?.let { putExtra("tenantId", it) }
                     }
                     safeStartServiceOrEnqueue(context, outIntent, normalizedIncoming)
                     return
@@ -89,6 +98,7 @@ class IncomingReceiver : BroadcastReceiver() {
                             putExtra("phoneNumber", normalizedIncoming)
                             putExtra("callId", callId)
                             putExtra("receivedAt", now)
+                            tenantId?.let { putExtra("tenantId", it) }
                         }
                         safeStartServiceOrEnqueue(context, i, normalizedIncoming)
                     } else {
@@ -121,6 +131,7 @@ class IncomingReceiver : BroadcastReceiver() {
                         putExtra("phoneNumber", normalizedIncoming)
                         putExtra("callId", callId)
                         putExtra("receivedAt", now)
+                        tenantId?.let { putExtra("tenantId", it) }
                     }
                     safeStartServiceOrEnqueue(context, i, normalizedIncoming)
                 }
@@ -143,6 +154,7 @@ class IncomingReceiver : BroadcastReceiver() {
                         putExtra("phoneNumber", normalizedIncoming)
                         putExtra("callId", callId)
                         putExtra("receivedAt", now)
+                        tenantId?.let { putExtra("tenantId", it) }
                     }
                     safeStartServiceOrEnqueue(context, i, normalizedIncoming)
                 }
@@ -174,6 +186,18 @@ class IncomingReceiver : BroadcastReceiver() {
                     else -> v?.toString()?.let { dataBuilder.putString(key, it) }
                 }
             }
+            // defensive: if tenantId present in prefs but somehow not in extras, add it
+            try {
+                val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                val tenant = prefs.getString("tenantId", null)
+                if (!tenant.isNullOrEmpty() && !dataBuilder.build().keyValueMap.containsKey("tenantId")) {
+                    dataBuilder.putString("tenantId", tenant)
+                    Log.d(TAG, "Added tenantId to Worker input: $tenant")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Error while adding tenantId to worker input: ${e.localizedMessage}")
+            }
+
             if (!svcIntent.hasExtra("receivedAt")) {
                 dataBuilder.putLong("receivedAt", System.currentTimeMillis())
             }

@@ -4,6 +4,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'models/lead.dart';
 import 'services/lead_service.dart';
@@ -20,7 +21,8 @@ class CallEventHandler {
   static const MethodChannel _openLeadChannel =
       MethodChannel('com.example.call_leads_app/openLead');
 
-  final LeadService _leadService = LeadService();
+  // Use the singleton instance
+  final LeadService _leadService = LeadService.instance;
 
   StreamSubscription? _subscription;
 
@@ -59,14 +61,21 @@ class CallEventHandler {
           } else if (args is String) {
             phone = args;
           }
+
           if (phone != null && phone.isNotEmpty) {
+            // Debug: log tenant so we can validate tenant flow end-to-end
+            final tenant = await _getTenantId();
+            print('📣 openLeadByPhone invoked for phone=$phone tenant=$tenant');
+
             // Find or create the lead and open UI
             final Lead lead = await _leadService.findOrCreateLead(phone: phone);
-            if (lead != null) _openLeadUI(lead);
+            _openLeadUI(lead);
+          } else {
+            print('⚠️ openLeadByPhone called with empty phone: $args');
           }
         }
-      } catch (e) {
-        print('❌ Error in openLeadByPhone handler: $e');
+      } catch (e, st) {
+        print('❌ Error in openLeadByPhone handler: $e\n$st');
       }
     });
 
@@ -74,8 +83,12 @@ class CallEventHandler {
         .receiveBroadcastStream()
         .listen(
       (event) {
-        final Map<String, dynamic> typedEvent = Map<String, dynamic>.from(event as Map);
-        _processCallEvent(typedEvent);
+        try {
+          final Map<String, dynamic> typedEvent = Map<String, dynamic>.from(event as Map);
+          _processCallEvent(typedEvent);
+        } catch (e, st) {
+          print('❌ Received non-map event or parsing error: $e\n$st');
+        }
       },
       onError: (error) {
         print("❌ STREAM ERROR: $error");
@@ -112,7 +125,7 @@ class CallEventHandler {
       final direction = (event['direction'] as String?)?.trim();
 
       // timestamp and duration may be provided by native call-log fallback
-      final timestampMs = event['timestamp'] as int? ?? DateTime.now().millisecondsSinceEpoch;
+      final timestampMs = (event['timestamp'] is int) ? event['timestamp'] as int : DateTime.now().millisecondsSinceEpoch;
       final duration = event['durationInSeconds'] as int?;
 
       if (outcome == null || direction == null) {
@@ -245,8 +258,8 @@ class CallEventHandler {
         print('⌛ Auto-finalize triggered for session ${buf.key} (no terminal event).');
         _autoFinalizeSession(buf.key);
       });
-    } catch (e) {
-      print("❌ Error handling intermediate event: $e");
+    } catch (e, st) {
+      print("❌ Error handling intermediate event: $e\n$st");
     }
   }
 
@@ -277,8 +290,8 @@ class CallEventHandler {
       Future.delayed(const Duration(milliseconds: 600), () {
         _sessions.remove(buf.key)?.dispose();
       });
-    } catch (e) {
-      print("❌ Error handling terminal event: $e");
+    } catch (e, st) {
+      print("❌ Error handling terminal event: $e\n$st");
     }
   }
 
@@ -311,6 +324,10 @@ class CallEventHandler {
       }
 
       final DateTime finalTs = DateTime.fromMillisecondsSinceEpoch(chosenTimestamp);
+
+      // Debug: log tenant when finalizing
+      final tenant = await _getTenantId();
+      print('📣 Finalizing call for phone=$phone tenant=$tenant outcome=$finalOutcome duration=$chosenDuration ts=$chosenTimestamp');
 
       // Call leadService.addFinalCallEvent ONCE with chosen data
       final Lead? updatedLead = await _leadService.addFinalCallEvent(
@@ -429,6 +446,10 @@ class CallEventHandler {
     final int? duration = consolidated.reversed.firstWhere((e) => e.durationSeconds != null, orElse: () => _CallEvent.empty()).durationSeconds;
 
     try {
+      // Debug: log tenant on auto-finalize
+      final tenant = await _getTenantId();
+      print('⌛ Auto-finalize for phone=$phone tenant=$tenant outcome=$outcome duration=$duration');
+
       final Lead? updatedLead = await _leadService.addFinalCallEvent(
         phone: phone,
         direction: direction,
@@ -440,8 +461,8 @@ class CallEventHandler {
       if (updatedLead != null && updatedLead.needsManualReview) {
         _openLeadUI(updatedLead);
       }
-    } catch (e) {
-      print('❌ Error auto-finalizing session $key: $e');
+    } catch (e, st) {
+      print('❌ Error auto-finalizing session $key: $e\n$st');
     } finally {
       _sessions.remove(key)?.dispose();
     }
@@ -466,7 +487,7 @@ class CallEventHandler {
     }
 
     _screenOpen = true;
-    print("📞 OPENING UI FOR ${lead.phoneNumber}");
+    print("📞 OPENING UI FOR ${lead.phoneNumber} (leadId=${lead.id})");
 
     navigatorKey.currentState!.push(
       MaterialPageRoute(
@@ -494,6 +515,15 @@ class CallEventHandler {
     target.absorb(old);
     old.dispose();
     print('ℹ️ Migrated session buffer $oldKey → $newKey');
+  }
+
+  Future<String> _getTenantId() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final t = prefs.getString('tenantId');
+      if (t != null && t.isNotEmpty) return t;
+    } catch (_) {}
+    return 'default_tenant';
   }
 }
 

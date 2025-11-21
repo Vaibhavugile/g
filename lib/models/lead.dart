@@ -66,7 +66,6 @@ class LatestCall {
   }
 }
 
-
 /// Entry in call history.
 class CallHistoryEntry {
   final String direction; // inbound / outbound
@@ -168,6 +167,7 @@ class Lead {
   final String id;
   final String name;
   final String phoneNumber; // normalized digits-only
+  final String tenantId; // NEW: tenant id for multitenant separation
   final String status;
   final String lastCallOutcome;
   final DateTime lastInteraction;
@@ -184,6 +184,7 @@ class Lead {
     required this.id,
     required this.name,
     required this.phoneNumber,
+    required this.tenantId,
     required this.status,
     this.lastCallOutcome = 'none',
     required this.lastInteraction,
@@ -200,13 +201,14 @@ class Lead {
   static String generateId() =>
       DateTime.now().millisecondsSinceEpoch.toString() + Random().nextInt(1000).toString();
 
-  factory Lead.newLead(String rawPhone) {
+  factory Lead.newLead(String rawPhone, {String tenantId = 'default_tenant'}) {
     final phone = normalizePhone(rawPhone);
     final now = DateTime.now();
     return Lead(
       id: generateId(),
       name: '',
       phoneNumber: phone,
+      tenantId: tenantId,
       status: 'new',
       lastCallOutcome: 'none',
       lastInteraction: now,
@@ -225,6 +227,7 @@ class Lead {
     String? id,
     String? name,
     String? phoneNumber,
+    String? tenantId,
     String? status,
     String? lastCallOutcome,
     DateTime? lastInteraction,
@@ -241,6 +244,7 @@ class Lead {
       id: id ?? this.id,
       name: name ?? this.name,
       phoneNumber: phoneNumber != null ? normalizePhone(phoneNumber) : this.phoneNumber,
+      tenantId: tenantId ?? this.tenantId,
       status: status ?? this.status,
       lastCallOutcome: lastCallOutcome ?? this.lastCallOutcome,
       lastInteraction: lastInteraction ?? this.lastInteraction,
@@ -252,7 +256,6 @@ class Lead {
       requirements: requirements ?? this.requirements,
       nextFollowUp: nextFollowUp ?? this.nextFollowUp,
       eventDate: eventDate ?? this.eventDate,
-
     );
   }
 
@@ -298,10 +301,14 @@ class Lead {
         .toList()
       ..sort((a, b) => a.timestamp.compareTo(b.timestamp)); // oldest -> newest
 
+    // Tenant handling
+    final tenant = (map['tenantId'] ?? map['tenant'] ?? 'default_tenant').toString();
+
     return Lead(
       id: (map['id'] ?? map['docId'] ?? generateId()).toString(),
       name: (map['name'] ?? '').toString(),
       phoneNumber: normalizePhone((map['phoneNumber'] ?? '').toString()),
+      tenantId: tenant,
       status: (map['status'] ?? 'new').toString(),
       lastCallOutcome: (map['lastCallOutcome'] ?? 'none').toString(),
       lastInteraction: lastInteraction,
@@ -315,12 +322,11 @@ class Lead {
       }).toList(),
       callHistory: history,
       needsManualReview: (map['needsManualReview'] as bool?) ?? false,
-            // NEW fields
+      // NEW fields
       address: (map['address'] as String?) ?? null,
       requirements: (map['requirements'] as String?) ?? null,
       nextFollowUp: map['nextFollowUp'] != null ? parseTs(map['nextFollowUp']) : null,
       eventDate: map['eventDate'] != null ? parseTs(map['eventDate']) : null,
-
     );
   }
 
@@ -328,6 +334,7 @@ class Lead {
         'id': id,
         'name': name,
         'phoneNumber': phoneNumber,
+        'tenantId': tenantId,
         'status': status,
         'lastCallOutcome': lastCallOutcome,
         'lastInteraction': lastInteraction.millisecondsSinceEpoch,
@@ -339,6 +346,5 @@ class Lead {
         'requirements': requirements,
         'nextFollowUp': nextFollowUp != null ? nextFollowUp!.millisecondsSinceEpoch : null,
         'eventDate': eventDate != null ? eventDate!.millisecondsSinceEpoch : null,
-
       };
 }

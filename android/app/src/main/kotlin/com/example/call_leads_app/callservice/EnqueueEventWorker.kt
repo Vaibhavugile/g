@@ -21,6 +21,18 @@ class EnqueueEventWorker(appContext: Context, workerParams: WorkerParameters) : 
                 eventMap[k] = v
             }
 
+            // --- NEW: ensure tenantId copied/preserved from inputData if present ---
+            try {
+                val inputTenant = data.getString("tenantId")
+                if (!inputTenant.isNullOrEmpty()) {
+                    eventMap["tenantId"] = inputTenant
+                    Log.d(TAG, "Preserved tenantId from inputData: $inputTenant")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Error while preserving tenantId from inputData: ${e.localizedMessage}")
+            }
+            // --- end tenant preservation ---
+
             // Normalize phoneNumber if present (digits-only)
             val phoneRaw = eventMap["phoneNumber"] as? String
             val normalized = phoneRaw?.filter { it.isDigit() }

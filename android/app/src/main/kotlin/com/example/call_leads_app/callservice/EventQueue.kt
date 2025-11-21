@@ -18,6 +18,7 @@ import org.json.JSONObject
  * Additional helpers added:
  *  - removeOldEntriesOlderThan: allow garbage-collection of stale head items (by receivedAt).
  *  - MAX_QUEUE_SIZE to prevent unbounded growth (defensive).
+ *  - getRawJson / dumpToLog for debugging.
  */
 class EventQueue(private val ctx: Context) {
 
@@ -224,6 +225,51 @@ class EventQueue(private val ctx: Context) {
                 Log.w(TAG, "Removed $removed stale queued entries older than ${olderThanMs}ms to avoid blocking.")
             }
             return removed
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Debug helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Returns the raw JSON string stored in SharedPreferences (or "[]" if none).
+     * Useful for debugging/inspection via logs or adb.
+     */
+    fun getRawJson(): String {
+        synchronized(lock) {
+            return try {
+                prefs.getString(KEY, "[]") ?: "[]"
+            } catch (e: Exception) {
+                "[]"
+            }
+        }
+    }
+
+    /**
+     * Log a compact dump of the queue (index and a short summary per event).
+     * Be careful with PII in logs in production.
+     */
+    fun dumpToLog() {
+        synchronized(lock) {
+            try {
+                val arr = loadArray()
+                Log.d(TAG, "EventQueue.dumpToLog: size=${arr.length()}")
+                for (i in 0 until arr.length()) {
+                    try {
+                        val jo = arr.optJSONObject(i)
+                        if (jo == null) continue
+                        val phone = jo.optString("phoneNumber", "<no-phone>")
+                        val tenant = jo.optString("tenantId", "<no-tenant>")
+                        val received = jo.opt("receivedAt") ?: "<no-ts>"
+                        Log.d(TAG, "  [$i] phone=$phone tenant=$tenant received=$received")
+                    } catch (e: Exception) {
+                        Log.d(TAG, "  [$i] (error reading item): ${e.localizedMessage}")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "dumpToLog failed: ${e.localizedMessage}")
+            }
         }
     }
 }

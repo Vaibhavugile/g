@@ -27,17 +27,14 @@ import com.google.firebase.firestore.Query
  * UploadWorker: reads queued events from EventQueue, and writes them into Firestore using the
  * hierarchy:
  *
- * /leads/{leadId}
- *    /calls/{callId}
- *       /events/{eventId}
+ * /tenants/{tenantId}/leads/{leadId}/calls/{callId}/events/{eventId}
  *
  * This variant is defensive:
  *  - Builds ops only for items that have a usable phone number (tries to recover using callId).
  *  - Commits in conservative chunks (well under Firestore limits).
  *  - Removes only the contiguous prefix of queued items that were actually uploaded,
  *    preventing accidental deletion of later items when some early items were skipped.
- *  - If an item lacks callId, attempt to find an existing "open" call doc for the lead (most recent,
- *    not finalized) and attach the event to it. If none found, generate a callId.
+ *  - If an item lacks tenantId, routes it to `tenants/default_tenant/review/queued_items` and marks it.
  */
 class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWorker(appContext, params) {
 
@@ -99,6 +96,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
             // Prepare UpsertOps only for items with usable phone numbers.
             data class IndexedOp(
                 val originalIndex: Int,
+                val tenantId: String,
                 val leadPath: String,
                 val leadData: Map<String, Any?>,
                 val callPath: String,
@@ -143,13 +141,40 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                     }
                     val callIdFromEvent = (item["callId"] as? String)
 
+                    // tenant handling: prefer explicit tenantId on item, else default to "default_tenant"
+                    var tenant = (item["tenantId"] as? String)?.takeIf { it.isNotEmpty() } ?: ""
+                    val needsTenantReview = (item["needsTenantReview"] as? Boolean) == true
+                    if (tenant.isEmpty()) {
+                        if (needsTenantReview) {
+                            // route to admin review tenant so data isn't lost
+                            tenant = "default_tenant"
+                            Log.w(TAG, "Item idx=$idx missing tenantId; routing to default_tenant for review.")
+                        } else {
+                            // Last-chance attempt: try to recover tenant from local prefs (best-effort)
+                            try {
+                                val prefs = applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                                val localTenant = prefs.getString("tenantId", null)
+                                if (!localTenant.isNullOrEmpty()) {
+                                    tenant = localTenant
+                                    Log.d(TAG, "Recovered tenant from prefs for idx=$idx: $tenant")
+                                } else {
+                                    tenant = "default_tenant"
+                                    Log.w(TAG, "No tenant available for idx=$idx; using default_tenant fallback.")
+                                }
+                            } catch (e: Exception) {
+                                tenant = "default_tenant"
+                                Log.w(TAG, "Error reading tenant from prefs; using default_tenant for idx=$idx: ${e.localizedMessage}")
+                            }
+                        }
+                    }
+
                     // If callId missing, try to find an open call doc for this phone; else generate one
                     val leadId = leadIdFromPhone(phone)
                     val callId = if (!callIdFromEvent.isNullOrEmpty()) {
                         callIdFromEvent
                     } else {
-                        // BEST-EFFORT: query recent calls for this lead and reuse an open one
-                        findOpenCallIdForLeadOrGenerate(firestore, leadId, phone, ts)
+                        // BEST-EFFORT: query recent calls for this lead under the tenant and reuse an open one
+                        findOpenCallIdForLeadOrGenerate(firestore, tenant, leadId, phone, ts)
                     }
 
                     // If the worker generated a callId (i.e. callIdFromEvent == null and find returned a gen),
@@ -162,30 +187,37 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                         }
                     }
 
-                    val leadRefPath = "leads/$leadId"
+                    // Build tenant-scoped paths
+                    val leadRefPath = "tenants/$tenant/leads/$leadId"
                     val callRefPath = "$leadRefPath/calls/$callId"
 
                     val leadUpsert = mapOf(
                         "phoneNumber" to phone,
-                        "lastSeen" to FieldValue.serverTimestamp()
+                        "lastSeen" to FieldValue.serverTimestamp(),
+                        "tenantId" to tenant
                     )
 
                     val callBase = mapOf(
                         "phoneNumber" to phone,
                         "direction" to direction,
-                        "createdAt" to FieldValue.serverTimestamp()
+                        "createdAt" to FieldValue.serverTimestamp(),
+                        "tenantId" to tenant
                     )
 
                     val eventData = mutableMapOf<String, Any?>(
                         "outcome" to outcome,
                         "timestamp" to ts,
                         "receivedAt" to (item["receivedAt"] ?: FieldValue.serverTimestamp()),
-                        "callId" to callId
+                        "callId" to callId,
+                        "tenantId" to tenant
                     )
                     if (duration != null) eventData["durationInSeconds"] = duration
                     if (callIdFromEvent == null) {
                         // if worker generated or selected callId, record that for traceability
                         eventData["callIdGeneratedByWorker"] = true
+                    }
+                    if (needsTenantReview) {
+                        eventData["needsTenantReview"] = true
                     }
 
                     val isFinal = (outcome == "ended" || duration != null)
@@ -201,6 +233,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                     ops.add(
                         IndexedOp(
                             originalIndex = idx,
+                            tenantId = tenant,
                             leadPath = leadRefPath,
                             leadData = leadUpsert,
                             callPath = callRefPath,
@@ -346,14 +379,21 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
     }
 
     /**
-     * Best-effort: find a recent open call doc for the given lead+phone.
+     * Best-effort: find a recent open call doc for the given lead+phone (under tenant).
      * Queries the calls subcollection for the lead ordered by createdAt descending,
      * then picks the first doc that appears not-finalized (no finalizedAt / no finalOutcome).
      * If query fails or nothing suitable is found, returns a generated callId.
      */
-    private suspend fun findOpenCallIdForLeadOrGenerate(firestore: FirebaseFirestore, leadId: String, phone: String, ts: Long): String {
+    private suspend fun findOpenCallIdForLeadOrGenerate(
+        firestore: FirebaseFirestore,
+        tenant: String,
+        leadId: String,
+        phone: String,
+        ts: Long
+    ): String {
         try {
-            val callsRef = firestore.collection("leads").document(leadId).collection("calls")
+            val callsRef = firestore.collection("tenants").document(tenant).collection("leads")
+                .document(leadId).collection("calls")
             // Query most recent calls for this phone. (Order and limit is lightweight.)
             val qSnap = callsRef
                 .whereEqualTo("phoneNumber", phone)
@@ -367,17 +407,17 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                     val finalizedAt = doc.get("finalizedAt")
                     val finalOutcome = doc.get("finalOutcome")
                     if (finalizedAt == null && finalOutcome == null) {
-                        Log.d(TAG, "Reusing open call doc ${doc.id} for phone=$phone")
+                        Log.d(TAG, "Reusing open call doc ${doc.id} for phone=$phone under tenant=$tenant")
                         return doc.id
                     }
                 }
             }
         } catch (e: Exception) {
             // Query could fail on missing index or network; fallback to generate
-            Log.w(TAG, "Open-call lookup failed for lead=$leadId phone=$phone : ${e.localizedMessage}")
+            Log.w(TAG, "Open-call lookup failed for tenant=$tenant lead=$leadId phone=$phone : ${e.localizedMessage}")
         }
         val gen = generateCallId(ts)
-        Log.d(TAG, "No open call found; generated callId=$gen for phone=$phone")
+        Log.d(TAG, "No open call found; generated callId=$gen for phone=$phone under tenant=$tenant")
         return gen
     }
 

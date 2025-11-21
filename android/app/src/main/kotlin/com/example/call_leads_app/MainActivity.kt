@@ -88,6 +88,38 @@ class MainActivity : FlutterActivity() {
                     }
                 }
 
+                // NEW: allow Flutter to persist tenantId into native SharedPreferences
+                "setTenantId" -> {
+                    try {
+                        val tenantId = call.argument<String>("tenantId")
+                        if (!tenantId.isNullOrEmpty()) {
+                            val prefs = getSharedPreferences("call_leads_prefs", Context.MODE_PRIVATE)
+                            prefs.edit().putString("tenantId", tenantId).apply()
+                            Log.d(TAG, "Native: saved tenantId=$tenantId")
+                            result.success(true)
+                        } else {
+                            Log.w(TAG, "setTenantId called with empty tenantId")
+                            result.success(false)
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "setTenantId error: ${e.localizedMessage}", e)
+                        result.success(false)
+                    }
+                }
+
+                // NEW: clear tenantId from native prefs
+                "clearTenantId" -> {
+                    try {
+                        val prefs = getSharedPreferences("call_leads_prefs", Context.MODE_PRIVATE)
+                        prefs.edit().remove("tenantId").apply()
+                        Log.d(TAG, "Native: cleared tenantId from prefs")
+                        result.success(true)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "clearTenantId error: ${e.localizedMessage}", e)
+                        result.success(false)
+                    }
+                }
+
                 else -> result.notImplemented()
             }
         }

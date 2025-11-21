@@ -1,7 +1,8 @@
 import 'dart:async';
-import 'dart:convert';                        // ⬅ added
-import 'package:crypto/crypto.dart';          // ⬅ added
+import 'dart:convert'; // ⬅ added
+import 'package:crypto/crypto.dart'; // ⬅ added
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:shared_preferences/shared_preferences.dart'; // ⬅ added
 import '../models/lead.dart';
 
 /// Robust LeadService with:
@@ -16,6 +17,7 @@ class LeadService {
   LeadService._internal();
 
   final FirebaseFirestore _db = FirebaseFirestore.instance;
+  // kept for compatibility — but most operations will use tenant-scoped collection via _tenantLeadsCollection()
   final CollectionReference<Map<String, dynamic>> _leadsCollection =
       FirebaseFirestore.instance.collection('leads');
 
@@ -23,6 +25,26 @@ class LeadService {
 
   /// per-normalized-phone pending operation
   final Map<String, Completer<Lead>> _pendingFindOrCreates = {};
+
+  // -------------------------------------------------------------------------
+  // TENANT HELPERS
+  // -------------------------------------------------------------------------
+  /// Read tenantId from Flutter SharedPreferences. Falls back to 'default_tenant'.
+  Future<String> _getTenantId() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final t = prefs.getString('tenantId');
+      if (t != null && t.isNotEmpty) return t;
+    } catch (_) {}
+    return 'default_tenant';
+  }
+
+  /// Resolve the tenant-scoped leads collection:
+  /// /tenants/{tenantId}/leads
+  Future<CollectionReference<Map<String, dynamic>>> _tenantLeadsCollection() async {
+    final tenant = await _getTenantId();
+    return _db.collection('tenants').doc(tenant).collection('leads');
+  }
 
   // -------------------------------------------------------------------------
   // Helpers
@@ -57,7 +79,9 @@ class LeadService {
   // -------------------------------------------------------------------------
   Future<void> loadLeads() async {
     try {
-      final snapshot = await _leadsCollection.get();
+      // Use tenant-scoped collection
+      final col = await _tenantLeadsCollection();
+      final snapshot = await col.get();
       _cached.clear();
       _cached.addAll(snapshot.docs.map((d) {
         final map = d.data();
@@ -88,7 +112,9 @@ class LeadService {
     } catch (_) {}
 
     try {
-      final doc = await _leadsCollection.doc(leadId).get();
+      // Use tenant-scoped collection
+      final col = await _tenantLeadsCollection();
+      final doc = await col.doc(leadId).get();
       if (doc.exists && doc.data() != null) {
         final lead = Lead.fromMap(Map<String, dynamic>.from(doc.data()!))
             .copyWith(id: doc.id);
@@ -119,7 +145,9 @@ class LeadService {
         }
       }
 
-      await _leadsCollection.doc(lead.id).set(lead.toMap());
+      // Use tenant-scoped collection
+      final col = await _tenantLeadsCollection();
+      await col.doc(lead.id).set(lead.toMap(), SetOptions(merge: true));
       print("✅ [FIRESTORE] Saved lead ${lead.id}");
 
       if (index == -1) {
@@ -191,7 +219,8 @@ class LeadService {
     try {
       // 3. Firestore query (legacy lookup by phoneNumber)
       try {
-        final snap = await _leadsCollection
+        final col = await _tenantLeadsCollection();
+        final snap = await col
             .where('phoneNumber', isEqualTo: normalized)
             .limit(1)
             .get();
@@ -230,7 +259,9 @@ class LeadService {
       final digits = normalized.isEmpty ? _normalize(phoneFallback) : normalized;
       final leadId = _leadIdFromPhone(digits);
 
-      final docRef = _leadsCollection.doc(leadId);
+      // Use tenant-scoped collection
+      final colRef = await _tenantLeadsCollection();
+      final docRef = colRef.doc(leadId);
       final doc = await docRef.get();
 
       Lead newLead;
@@ -241,7 +272,8 @@ class LeadService {
             .copyWith(id: leadId);
       } else {
         // otherwise create fresh
-        newLead = Lead.newLead(digits).copyWith(
+        final tenantId = await _getTenantId();
+        newLead = Lead.newLead(digits, tenantId: tenantId).copyWith(
           id: leadId,
           lastCallOutcome: finalOutcome ?? 'none',
           lastUpdated: DateTime.now(),
@@ -421,7 +453,9 @@ class LeadService {
 
   Future<void> deleteLead(String id) async {
     try {
-      await _leadsCollection.doc(id).delete();
+      // Use tenant-scoped collection for delete as well
+      final col = await _tenantLeadsCollection();
+      await col.doc(id).delete();
       _cached.removeWhere((l) => l.id == id);
       print("🗑 Deleted $id");
     } catch (e) {

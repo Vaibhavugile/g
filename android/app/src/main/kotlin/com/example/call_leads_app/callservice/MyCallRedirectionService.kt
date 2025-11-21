@@ -48,6 +48,13 @@ class MyCallRedirectionService : CallRedirectionService() {
                 Log.d(TAG, "Saved callId marker for $normalized -> $callId (and reverse mapping)")
             }
 
+            // read tenant and attach if present
+            val tenant = try {
+                prefs.getString("tenantId", null)
+            } catch (e: Exception) {
+                null
+            }
+
             val intent = Intent().apply {
                 setClassName(packageName, CALL_SERVICE_CLASS_NAME)
                 putExtra("event", "outgoing_start")
@@ -55,9 +62,10 @@ class MyCallRedirectionService : CallRedirectionService() {
                 putExtra("phoneNumber", normalized)
                 putExtra("callId", callId)
                 putExtra("receivedAt", System.currentTimeMillis())
+                tenant?.let { putExtra("tenantId", it) }
             }
 
-            Log.d(TAG, "Starting CallService for outgoing_start with callId=$callId")
+            Log.d(TAG, "Starting CallService for outgoing_start with callId=$callId and tenant=$tenant")
             ContextCompat.startForegroundService(this, intent)
 
             placeCallUnmodified()

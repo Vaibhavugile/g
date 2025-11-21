@@ -56,6 +56,18 @@ class OutgoingReceiver : BroadcastReceiver() {
                 Log.d(TAG, "Created new callId marker for $markerKey -> $callId")
             }
 
+            // read tenantId from prefs and attach if present
+            val tenant = try {
+                prefs.getString("tenantId", null)
+            } catch (e: Exception) {
+                null
+            }
+            if (tenant == null) {
+                Log.d(TAG, "OutgoingReceiver: no tenantId in prefs (proceeding without tenant).")
+            } else {
+                Log.d(TAG, "OutgoingReceiver: attaching tenantId=$tenant to outgoing event.")
+            }
+
             val serviceIntent = Intent(context, CallService::class.java).apply {
                 putExtra("direction", "outbound")
                 // prefer normalized if available, otherwise send raw
@@ -63,6 +75,7 @@ class OutgoingReceiver : BroadcastReceiver() {
                 putExtra("event", "outgoing_start")
                 putExtra("callId", callId)
                 putExtra("receivedAt", System.currentTimeMillis())
+                tenant?.let { putExtra("tenantId", it) }
             }
 
             try {
@@ -86,7 +99,7 @@ class OutgoingReceiver : BroadcastReceiver() {
     }
 
     // -----------------------
-    // CallId lifecycle helpers (active + recent semantics)
+    // CallId lifecycle helpers (active & recent semantics)
     // -----------------------
     private fun markCallActiveForPhone(ctx: Context, phoneDigitsOrRaw: String, callId: String) {
         try {
