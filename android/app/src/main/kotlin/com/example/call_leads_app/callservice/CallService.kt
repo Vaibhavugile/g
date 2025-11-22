@@ -28,6 +28,11 @@ import kotlin.math.abs
 import java.util.ArrayDeque
 import java.util.concurrent.TimeUnit
 
+// Added imports for recording
+import android.media.MediaRecorder
+import java.io.File
+import java.io.IOException
+
 class CallService : Service() {
 
     companion object {
@@ -115,6 +120,10 @@ class CallService : Service() {
     private var legacyListener: CallStateListener? = null
     private var modernCallback: TelephonyCallback? = null
 
+    // Recording state
+    private var recorder: MediaRecorder? = null
+    private var currentRecordingFile: String? = null
+
     override fun onCreate() {
         super.onCreate()
         createNotificationChannelIfNeeded()
@@ -162,6 +171,15 @@ class CallService : Service() {
             } else if (event != null && event != "state_change") {
                 // other immediate event (e.g., answered)
                 sendCallEvent(number, currentCallDirection ?: direction, "answered", System.currentTimeMillis(), null)
+                // Try to start recording for this answered event (best-effort)
+                try {
+                    val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                    val normalized = normalizeNumber(number) ?: number
+                    val callId = if (!normalized.isNullOrEmpty()) readActiveOrRecentCallId(applicationContext, normalized) ?: ensureCallIdForPhone(normalized, prefs) else callIdFromIntent
+                    startRecordingForCall(callId)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to start recording from onStartCommand: ${e.localizedMessage}")
+                }
             }
         }
 
@@ -424,11 +442,29 @@ class CallService : Service() {
                 if (previousCallState == TelephonyManager.CALL_STATE_RINGING) {
                     val dir = if (currentCallDirection == "outbound") "outbound" else "inbound"
                     sendCallEvent(currentCallNumber ?: incomingNumber ?: "unknown", currentCallDirection ?: dir, "answered", System.currentTimeMillis(), null)
+                    // Start recording when call transitions RINGING -> OFFHOOK (answered)
+                    try {
+                        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                        val normalized = normalizeNumber(currentCallNumber ?: incomingNumber) ?: (currentCallNumber ?: incomingNumber)
+                        val callId = if (!normalized.isNullOrEmpty()) readActiveOrRecentCallId(applicationContext, normalized) ?: ensureCallIdForPhone(normalized, prefs) else null
+                        startRecordingForCall(callId)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to start recording on OFFHOOK: ${e.localizedMessage}")
+                    }
                 } else if (previousCallState == TelephonyManager.CALL_STATE_IDLE) {
                     if (currentCallNumber.isNullOrEmpty()) {
                         readCallLogForLastCall()
                     } else {
                         sendCallEvent(currentCallNumber!!, currentCallDirection ?: "outbound", "answered", System.currentTimeMillis(), null)
+                        // Start recording for call
+                        try {
+                            val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                            val normalized = normalizeNumber(currentCallNumber) ?: currentCallNumber
+                            val callId = if (!normalized.isNullOrEmpty()) readActiveOrRecentCallId(applicationContext, normalized) ?: ensureCallIdForPhone(normalized, prefs) else null
+                            startRecordingForCall(callId)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed to start recording on OFFHOOK (idle->offhook): ${e.localizedMessage}")
+                        }
                     }
                 }
             }
@@ -687,13 +723,26 @@ class CallService : Service() {
             }
         }
 
-        val payload = mapOf(
+        // Attempt to stop recording and attach recordingPath to final payload (best-effort)
+        var recPath: String? = null
+        try {
+            recPath = stopRecordingAndReturnPath()
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed stopping recording during finalization: ${e.localizedMessage}")
+        }
+
+        val payload = mutableMapOf<String, Any?>(
             "phoneNumber" to phoneNumber,
             "direction" to if (isOutbound) "outbound" else "inbound",
             "outcome" to finalOutcome,
             "timestamp" to timestampMs,
             "durationInSeconds" to durationSec
         )
+
+        if (!recPath.isNullOrEmpty()) {
+            payload["recordingPath"] = recPath
+            Log.d(TAG, "Attached recordingPath to final payload: $recPath")
+        }
 
         Log.d(TAG, "📤 Emitting final event: $payload")
         // Persist to queue and forward to Flutter (or buffer)
@@ -720,6 +769,18 @@ class CallService : Service() {
         )
         Log.d(TAG, "📤 Sending event to Flutter (and persisting): $data")
         persistAndForwardEvent(data)
+
+        // Best-effort: start recording when we send an "answered" event
+        if (outcome == "answered") {
+            try {
+                val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                val normalized = normalizeNumber(number) ?: number
+                val callId = if (!normalized.isNullOrEmpty()) readActiveOrRecentCallId(applicationContext, normalized) ?: ensureCallIdForPhone(normalized, prefs) else null
+                startRecordingForCall(callId)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to start recording from sendCallEvent: ${e.localizedMessage}")
+            }
+        }
     }
 
     private fun readOutgoingMarker(): Pair<String, Long>? {
@@ -761,6 +822,7 @@ class CallService : Service() {
 
     override fun onDestroy() {
         unregisterTelephonyCallback()
+        releaseRecorder()
         super.onDestroy()
         Log.d(TAG, "🛑 Service destroyed")
     }
@@ -840,5 +902,70 @@ class CallService : Service() {
         } catch (e: Exception) {
             Log.w(TAG, "clearCallIdMapping failed: ${e.localizedMessage}")
         }
+    }
+
+    // -----------------------
+    // Recording helpers
+    // -----------------------
+    private fun startRecordingForCall(callId: String?) {
+        try {
+            if (recorder != null) {
+                Log.w(TAG, "startRecordingForCall: recorder already active")
+                return
+            }
+            val cid = callId ?: generateCallId()
+            val recordingsDir = File(applicationContext.getExternalFilesDir(null), "recordings")
+            if (!recordingsDir.exists()) recordingsDir.mkdirs()
+            val fname = "record_${cid}_${System.currentTimeMillis()}.m4a"
+            val file = File(recordingsDir, fname)
+            currentRecordingFile = file.absolutePath
+
+            recorder = MediaRecorder().apply {
+                // set sources — on many devices MIC will capture both sides; results vary by OEM/Android
+                setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
+                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                setAudioSamplingRate(44100)
+                setAudioEncodingBitRate(96000)
+                setOutputFile(file.absolutePath)
+                try {
+                    prepare()
+                    start()
+                    Log.d(TAG, "Started recording to ${file.absolutePath}")
+                } catch (e: IOException) {
+                    Log.e(TAG, "Failed to start recorder: ${e.localizedMessage}", e)
+                    releaseRecorder()
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "startRecordingForCall exception: ${e.localizedMessage}", e)
+            releaseRecorder()
+        }
+    }
+
+    private fun stopRecordingAndReturnPath(): String? {
+        try {
+            val r = recorder ?: return null
+            try { r.stop() } catch (t: Throwable) { Log.w(TAG, "stop() threw: ${t.localizedMessage}") }
+            try { r.release() } catch (t: Throwable) { /* ignore */ }
+            recorder = null
+            val path = currentRecordingFile
+            currentRecordingFile = null
+            Log.d(TAG, "Stopped recording; file=$path")
+            return path
+        } catch (e: Exception) {
+            Log.e(TAG, "stopRecording exception: ${e.localizedMessage}", e)
+            releaseRecorder()
+            return null
+        }
+    }
+
+    private fun releaseRecorder() {
+        try {
+            recorder?.reset()
+            recorder?.release()
+        } catch (ignored: Exception) {}
+        recorder = null
+        currentRecordingFile = null
     }
 }

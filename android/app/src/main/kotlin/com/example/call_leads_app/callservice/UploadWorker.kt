@@ -1,6 +1,7 @@
 package com.example.call_leads_app.callservice
 
 import android.content.Context
+import android.net.Uri
 import android.util.Log
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
@@ -16,7 +17,9 @@ import com.google.firebase.auth.FirebaseAuthException
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.SetOptions
+import com.google.firebase.storage.FirebaseStorage
 import kotlinx.coroutines.tasks.await
+import java.io.File
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
@@ -24,17 +27,13 @@ import kotlin.random.Random
 import com.google.firebase.firestore.Query
 
 /**
- * UploadWorker: reads queued events from EventQueue, and writes them into Firestore using the
- * hierarchy:
- *
+ * UploadWorker: reads queued events from EventQueue, uploads optional recordings to
+ * Firebase Storage, and writes events into Firestore under
  * /tenants/{tenantId}/leads/{leadId}/calls/{callId}/events/{eventId}
  *
- * This variant is defensive:
- *  - Builds ops only for items that have a usable phone number (tries to recover using callId).
- *  - Commits in conservative chunks (well under Firestore limits).
- *  - Removes only the contiguous prefix of queued items that were actually uploaded,
- *    preventing accidental deletion of later items when some early items were skipped.
- *  - If an item lacks tenantId, routes it to `tenants/default_tenant/review/queued_items` and marks it.
+ * If a queued event contains "recordingPath", the worker will attempt to upload the
+ * file at that local path to Firebase Storage, obtain a download URL, attach it to the
+ * event (recordingUrl) and also create a recordings doc under the call: calls/{callId}/recordings/{fileName}
  */
 class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWorker(appContext, params) {
 
@@ -49,7 +48,6 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
     override suspend fun doWork(): Result {
         try {
             // Garbage-collect stale head entries so they don't block the queue indefinitely.
-            // Remove contiguous head items older than 60s (configurable here).
             try {
                 val removed = queue.removeOldEntriesOlderThan(60_000L)
                 if (removed > 0) Log.w(TAG, "Removed $removed stale head items before processing to avoid blocking.")
@@ -84,6 +82,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
             }
 
             val firestore = FirebaseFirestore.getInstance()
+            val storage = FirebaseStorage.getInstance()
 
             val items = queue.peekAll()
             if (items.isEmpty()) {
@@ -93,7 +92,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
 
             Log.d(TAG, "Preparing to upload ${items.size} queued events.")
 
-            // Prepare UpsertOps only for items with usable phone numbers.
+            // Prepare UpsertOps only for items that have a usable phone number.
             data class IndexedOp(
                 val originalIndex: Int,
                 val tenantId: String,
@@ -107,8 +106,11 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
 
             val ops = mutableListOf<IndexedOp>()
 
-            for ((idx, item) in items.withIndex()) {
+            for ((idx, rawItem) in items.withIndex()) {
                 try {
+                    // Make a mutable map copy so we can attach recordingUrl if upload succeeds
+                    val item = rawItem.toMutableMap()
+
                     var phoneRaw = (item["phoneNumber"] as? String) ?: ""
 
                     // If phone missing, try to recover using callId mapping (fast path)
@@ -187,6 +189,61 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                         }
                     }
 
+                    // --- Recording upload: if item includes recordingPath, try to upload and attach recordingUrl ---
+                    try {
+                        val recPath = (item["recordingPath"] as? String)
+                        if (!recPath.isNullOrEmpty()) {
+                            try {
+                                val f = File(recPath)
+                                if (f.exists()) {
+                                    // Storage path: tenants/{tenant}/leads/{leadId}/calls/{callId}/recordings/{filename}
+                                    val filename = f.name
+                                    val storageRef = storage.reference.child("tenants/$tenant/leads/$leadId/calls/$callId/recordings/$filename")
+
+                                    // Upload file
+                                    storageRef.putFile(Uri.fromFile(f)).await()
+                                    val downloadUrl = storageRef.downloadUrl.await().toString()
+
+                                    Log.d(TAG, "Uploaded recording for queued item idx=$idx to $downloadUrl")
+
+                                    // Attach to item so eventData below includes it
+                                    item["recordingUrl"] = downloadUrl
+                                    item["recordingFileName"] = filename
+
+                                    // create metadata doc under call's recordings subcollection
+                                    try {
+                                        val recDocRef = firestore.document("tenants/$tenant/leads/$leadId/calls/$callId/recordings/$filename")
+                                        val recMeta = hashMapOf<String, Any?>(
+                                            "fileName" to filename,
+                                            "url" to downloadUrl,
+                                            "uploadedAt" to FieldValue.serverTimestamp(),
+                                            "size" to f.length()
+                                        )
+                                        recDocRef.set(recMeta, SetOptions.merge()).await()
+                                    } catch (recEx: Exception) {
+                                        Log.w(TAG, "Failed to create recordings doc for idx=$idx: ${recEx.localizedMessage}")
+                                    }
+
+                                    // delete local file after successful upload to conserve space
+                                    try {
+                                        if (f.delete()) {
+                                            Log.d(TAG, "Deleted local recording file after upload: ${f.absolutePath}")
+                                        }
+                                    } catch (delEx: Exception) {
+                                        Log.w(TAG, "Failed to delete local recording file: ${delEx.localizedMessage}")
+                                    }
+                                } else {
+                                    Log.w(TAG, "Recording path present but file missing: $recPath")
+                                }
+                            } catch (upEx: Exception) {
+                                Log.w(TAG, "Failed uploading recording for idx=$idx: ${upEx.localizedMessage}")
+                                // continue — we still want to process the event (without recordingUrl)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Recording upload attempt failed for idx=$idx: ${e.localizedMessage}")
+                    }
+
                     // Build tenant-scoped paths
                     val leadRefPath = "tenants/$tenant/leads/$leadId"
                     val callRefPath = "$leadRefPath/calls/$callId"
@@ -220,6 +277,14 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                         eventData["needsTenantReview"] = true
                     }
 
+                    // If recordingUrl was attached during upload, include it in the event
+                    val recUrl = item["recordingUrl"] as? String
+                    val recFileName = item["recordingFileName"] as? String
+                    if (!recUrl.isNullOrEmpty()) {
+                        eventData["recordingUrl"] = recUrl
+                        eventData["recordingFileName"] = recFileName
+                    }
+
                     val isFinal = (outcome == "ended" || duration != null)
                     val finalizeFields = if (isFinal) {
                         val ff = mutableMapOf<String, Any?>( //
@@ -243,7 +308,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                         )
                     )
                 } catch (e: Exception) {
-                    Log.w(TAG, "Skipping malformed queued item at index $idx: $item", e)
+                    Log.w(TAG, "Skipping malformed queued item at index $idx: $rawItem", e)
                 }
             }
 
@@ -429,38 +494,45 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
      * that are still active (callid_active_until > now) or very recent (callid_ts within REUSE_WINDOW_MS).
      */
     private fun tryRecoverPhoneForCallId(ctx: Context, callId: String): String? {
-        try {
-            val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            // direct reverse mapping
-            val direct = prefs.getString("callid_to_phone_$callId", null)
-            if (!direct.isNullOrEmpty()) return direct
+    try {
+        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        // direct reverse mapping
+        val direct = prefs.getString("callid_to_phone_$callId", null)
+        if (!direct.isNullOrEmpty()) return direct
 
-            // legacy fallback: look for keys named callid_<phone> == callId but check activity/recency
-            val all = prefs.all
-            val now = System.currentTimeMillis()
-            for ((k, v) in all) {
-                if (!k.startsWith("callid_")) continue
-                // skip helper keys
-                if (k.startsWith("callid_to_phone_") || k.startsWith("callid_active_until_") || k.startsWith("callid_ts_")) continue
-                val value = v as? String ?: continue
-                if (value != callId) continue
+        // legacy fallback: look for keys named callid_<phone> == callId but check activity/recency
+        val all = prefs.all
+        val now = System.currentTimeMillis()
 
-                val normalized = k.removePrefix("callid_")
-                val activeUntil = prefs.getLong("callid_active_until_$normalized", 0L)
-                if (activeUntil > now) {
-                    return normalized
-                }
-                val ts = prefs.getLong("callid_ts_$normalized", 0L)
-                if (ts != 0L && (now - ts) <= REUSE_WINDOW_MS) {
-                    return normalized
-                }
-                // else too old, continue scanning
+        // iterate entries explicitly to avoid destructive lambdas or ambiguous parameter types
+        for (entry in all.entries) {
+            val k: String = entry.key
+            val vAny: Any? = entry.value
+
+            if (!k.startsWith("callid_")) continue
+            // skip helper keys
+            if (k.startsWith("callid_to_phone_") || k.startsWith("callid_active_until_") || k.startsWith("callid_ts_")) continue
+
+            val value: String = vAny as? String ?: continue
+            if (value != callId) continue
+
+            val normalized = k.removePrefix("callid_")
+            val activeUntil = prefs.getLong("callid_active_until_$normalized", 0L)
+            if (activeUntil > now) {
+                return normalized
             }
-        } catch (e: Exception) {
-            Log.w(TAG, "tryRecoverPhoneForCallId failed: ${e.localizedMessage}")
+            val ts = prefs.getLong("callid_ts_$normalized", 0L)
+            if (ts != 0L && (now - ts) <= REUSE_WINDOW_MS) {
+                return normalized
+            }
+            // else too old, continue scanning
         }
-        return null
+    } catch (e: Exception) {
+        Log.w(TAG, "tryRecoverPhoneForCallId failed: ${e.localizedMessage}")
     }
+    return null
+}
+
 
     /**
      * Persist reverse & forward mappings for an active call so other components can recover phone by callId.
@@ -484,3 +556,4 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
         }
     }
 }
+

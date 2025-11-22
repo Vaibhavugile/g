@@ -3,42 +3,32 @@ import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 /// PermissionsService
-///
-/// Ensures the app has the runtime permissions needed for call detection & call-log fallback:
-///  - phone (permission_handler: Permission.phone)
-///  - call log (READ_CALL_LOG) — on Android this is handled by Permission.phone in some mappings,
-///    but we explicitly request Permission.phone and also check Permission.sms as a fallback
-///    if your mapping/environment requires it.
+/// Ensures runtime permissions for:
+///  - Phone (READ_PHONE_STATE, READ_CALL_LOG indirect)
+///  - Notifications
+///  - Microphone (for call recording)
 ///
 /// Usage:
 ///   await PermissionsService.requestPermissions(context: context);
-///
 class PermissionsService {
-  /// Request the basic permissions used by the app. Returns true if the essential permissions
-  /// (phone / call log) are granted, false otherwise.
+  /// Request all essential permissions.
+  /// Returns true only if phone + microphone permissions are granted.
   static Future<bool> requestPermissions({BuildContext? context}) async {
     try {
-      // Request a set of relevant permissions.
-      // Note: permission_handler currently exposes `Permission.phone` which maps to READ_PHONE_STATE
-      // and related on Android. READ_CALL_LOG may not be directly exposed by permission_handler
-      // for all versions; we handle common mappings and check status explicitly.
-      final Map<Permission, PermissionStatus> statuses = await [
-        Permission.phone, // core telephony
-        Permission.notification, // optional, your manifest includes POST_NOTIFICATIONS
+      final statuses = await [
+        Permission.phone,
+        Permission.notification,
+        Permission.microphone,
       ].request();
 
-      // Check effective call-log access:
-      final bool phoneGranted = await _isPhonePermissionGranted();
-      if (phoneGranted) {
-        return true;
-      }
+      final phoneGranted = await _isPhonePermissionGranted();
+      final micGranted = await Permission.microphone.isGranted;
 
-      // Not granted: if context is present, show a dialog guiding the user to settings
+      if (phoneGranted && micGranted) return true;
+
       if (context != null) {
         final open = await _showRequestSettingsDialog(context);
-        if (open) {
-          await openAppSettings();
-        }
+        if (open) await openAppSettings();
       }
 
       return false;
@@ -48,62 +38,46 @@ class PermissionsService {
     }
   }
 
-  /// Check whether the app effectively has access to call-related data.
-  /// Returns true if Permission.phone is granted (best-effort), or if the app settings show
-  /// the user has granted runtime permissions on the platform.
+  /// Check phone permission (READ_PHONE_STATE / READ_CALL_LOG indirectly).
   static Future<bool> _isPhonePermissionGranted() async {
     try {
       final status = await Permission.phone.status;
-      if (status.isGranted) return true;
-
-      // Some OEMs / mappings might require checking other permissions; try READ_CALL_LOG if available.
-      // permission_handler doesn't always expose READ_CALL_LOG explicitly; but Permission.sms or contacts
-      // are not the same. We'll treat phone.isGranted as the canonical indicator for our app.
-      return false;
+      return status.isGranted;
     } catch (e) {
       debugPrint('PermissionsService._isPhonePermissionGranted error: $e');
       return false;
     }
   }
 
-  /// Simple UI dialog prompting the user to open app settings when permissions are permanently denied.
+  /// Dialog prompting user to open Settings.
   static Future<bool> _showRequestSettingsDialog(BuildContext ctx) async {
     return showDialog<bool>(
       context: ctx,
-      builder: (c) {
-        return AlertDialog(
-          title: const Text('Permissions needed'),
-          content: const Text(
-              'To reliably detect and finalize calls we need phone permissions. Please open app settings and grant Phone / Call Log permissions.'),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(c).pop(false),
-              child: const Text('Cancel'),
-            ),
-            TextButton(
-              onPressed: () => Navigator.of(c).pop(true),
-              child: const Text('Open settings'),
-            ),
-          ],
-        );
-      },
+      builder: (c) => AlertDialog(
+        title: const Text('Permissions Required'),
+        content: const Text(
+          'Phone + Microphone permissions are required for call detection and call recording. '
+          'Please enable them in system settings.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(c).pop(false), child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.of(c).pop(true), child: const Text('Open Settings')),
+        ],
+      ),
     ).then((v) => v ?? false);
   }
 
-  /// Public helper to check permission state and optionally open the system settings page if needed.
+  /// Ensure phone permission interactively.
   static Future<bool> ensurePhonePermission({BuildContext? context}) async {
-    final granted = await _isPhonePermissionGranted();
-    if (granted) return true;
+    final phone = await Permission.phone.isGranted;
+    if (phone) return true;
 
-    // Try to request interactively
     final status = await Permission.phone.request();
     if (status.isGranted) return true;
 
     if (status.isPermanentlyDenied && context != null) {
       final open = await _showRequestSettingsDialog(context);
-      if (open) {
-        await openAppSettings();
-      }
+      if (open) await openAppSettings();
     }
 
     return false;
