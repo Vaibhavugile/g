@@ -3,6 +3,8 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import '../models/lead.dart';
 import '../services/lead_service.dart';
 import 'lead_form_screen.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
 // Note: lead_details_screen.dart is no longer imported as it is deprecated.
 
 // -------------------------------------------------------------------------
@@ -108,24 +110,34 @@ class _LeadListScreenState extends State<LeadListScreen> {
   }
 
   /// Fetch the single most recent call doc for the given lead.
-  Future<LatestCall?> fetchLatestCallForLead(String leadId) async {
-    try {
-      final q = await FirebaseFirestore.instance
-          .collection('leads')
-          .doc(leadId)
-          .collection('calls')
-          .orderBy('createdAt', descending: true)
-          .limit(1)
-          .get();
-      if (q.docs.isEmpty) return null;
-      return LatestCall.fromDoc(q.docs.first);
-    } catch (e, st) {
-      // keep UI resilient: log and return null
-      // ignore: avoid_print
-      print('fetchLatestCallForLead error for $leadId: $e\n$st');
-      return null;
-    }
+  /// Fetch the single most recent call doc for the given lead from the tenant-scoped path.
+Future<LatestCall?> fetchLatestCallForLead(String leadId) async {
+  try {
+    // Read tenantId from Flutter SharedPreferences (same place AuthService writes)
+    final prefs = await SharedPreferences.getInstance();
+    final tenantId = (prefs.getString('tenantId') ?? 'default_tenant').toString();
+
+    final q = await FirebaseFirestore.instance
+        .collection('tenants')
+        .doc(tenantId)
+        .collection('leads')
+        .doc(leadId)
+        .collection('calls')
+        .orderBy('createdAt', descending: true)
+        .limit(1)
+        .get();
+
+    if (q.docs.isEmpty) return null;
+    // Note: LatestCall.fromDoc expects QueryDocumentSnapshot (your local type) — that matches q.docs.first
+    return LatestCall.fromDoc(q.docs.first);
+  } catch (e, st) {
+    // keep UI resilient: log and return null
+    // ignore: avoid_print
+    print('fetchLatestCallForLead error for $leadId: $e\n$st');
+    return null;
   }
+}
+
 
   /// Load leads and in parallel fetch latest calls (batched to avoid too many concurrent reads)
   Future<void> _loadLeads() async {

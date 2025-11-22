@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../models/lead.dart';
 import '../services/lead_service.dart';
 
@@ -146,11 +147,24 @@ class _LeadFormScreenState extends State<LeadFormScreen> {
         "${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}";
   }
 
+  Future<String> _getTenantIdFromPrefs() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final t = prefs.getString('tenantId');
+      if (t != null && t.isNotEmpty) return t;
+    } catch (_) {}
+    return 'default_tenant';
+  }
+
   /// Persist a transient lead (if id empty) and include address/requirements/dates
   Future<void> _persistLeadIfTransient() async {
     if (_lead.id.isEmpty) {
       print("📝 First save: Persisting new lead for ${_lead.phoneNumber}");
+      // createLead() in your LeadService should create the doc under tenant-scoped collection.
       final persistedLead = await _service.createLead(_lead.phoneNumber);
+
+      // ensure tenantId is present on the lead we save locally
+      final prefsTenant = await _getTenantIdFromPrefs();
 
       final updatedTransientLead = persistedLead.copyWith(
         name: _nameController.text.trim(),
@@ -165,9 +179,10 @@ class _LeadFormScreenState extends State<LeadFormScreen> {
             _requirementsController.text.trim().isEmpty ? null : _requirementsController.text.trim(),
         nextFollowUp: _nextFollowUp,
         eventDate: _eventDate,
+        tenantId: persistedLead.tenantId.isNotEmpty ? persistedLead.tenantId : prefsTenant,
       );
 
-      // save (no return expected)
+      // save (no return expected) — LeadService.saveLead writes to tenant-scoped leads collection
       await _service.saveLead(updatedTransientLead);
 
       // Try to refresh canonical lead after save; fallback to updatedTransientLead
@@ -228,18 +243,22 @@ class _LeadFormScreenState extends State<LeadFormScreen> {
       lastInteraction: DateTime.now(),
     );
 
+    // ensure tenantId present before saving
+    final prefsTenant = await _getTenantIdFromPrefs();
+    final leadWithTenant = updatedLead.copyWith(tenantId: updatedLead.tenantId.isNotEmpty ? updatedLead.tenantId : prefsTenant);
+
     // Persist using saveLead (returns void in your service).
-    await _service.saveLead(updatedLead);
+    await _service.saveLead(leadWithTenant);
 
     // Try to fetch canonical saved lead; if not available, fallback to updatedLead
     Lead? refreshed;
     try {
-      refreshed = await _service.getLead(leadId: updatedLead.id);
+      refreshed = await _service.getLead(leadId: leadWithTenant.id);
     } catch (e) {
       print('Warning: could not fetch refreshed lead after save: $e');
       refreshed = null;
     }
-    final savedLead = refreshed ?? updatedLead;
+    final savedLead = refreshed ?? leadWithTenant;
 
     _hasUserSavedOrNoted = true;
 
@@ -397,7 +416,7 @@ class _LeadFormScreenState extends State<LeadFormScreen> {
   }
 
   // -------------------------------------------------------------------
-  // NEW: load latest up to 5 call docs from calls subcollection for this lead
+  // NEW: load latest up to 5 call docs from tenant-scoped calls subcollection for this lead
   // -------------------------------------------------------------------
   Future<void> _loadLatestCalls() async {
     setState(() {
@@ -413,7 +432,11 @@ class _LeadFormScreenState extends State<LeadFormScreen> {
         return;
       }
 
+      final tenantId = await _getTenantIdFromPrefs();
+
       final q = await FirebaseFirestore.instance
+          .collection('tenants')
+          .doc(tenantId)
           .collection('leads')
           .doc(_lead.id)
           .collection('calls')

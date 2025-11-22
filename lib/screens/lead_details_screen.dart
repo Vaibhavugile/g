@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../models/lead.dart';
 import '../services/lead_service.dart';
 
@@ -143,9 +144,20 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
         "${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}";
   }
 
+  Future<String> _getTenantIdFromPrefs() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final t = prefs.getString('tenantId');
+      if (t != null && t.isNotEmpty) return t;
+    } catch (_) {}
+    return 'default_tenant';
+  }
+
   Future<void> _saveAll() async {
     setState(() => _saving = true);
     try {
+      // ensure tenantId present when saving
+      final prefsTenant = await _getTenantIdFromPrefs();
       final updated = _lead.copyWith(
         name: _nameController.text.trim(),
         // phone is read-only here (modify pattern if you want editable phone)
@@ -156,6 +168,7 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
         eventDate: _eventDate,
         lastUpdated: DateTime.now(),
         lastInteraction: DateTime.now(),
+        tenantId: _lead.tenantId.isNotEmpty ? _lead.tenantId : prefsTenant,
       );
 
       final saved = await _service.saveLead(updated);
@@ -180,10 +193,12 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
   }
 
   Future<void> _saveStatus(String newStatus) async {
+    final prefsTenant = await _getTenantIdFromPrefs();
     final updated = _lead.copyWith(
       status: newStatus,
       lastInteraction: DateTime.now(),
       lastUpdated: DateTime.now(),
+      tenantId: _lead.tenantId.isNotEmpty ? _lead.tenantId : prefsTenant,
     );
 
     final saved = await _service.saveLead(updated);
@@ -325,7 +340,7 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
   }
 
   // -------------------------
-  // Load latest up to 5 calls
+  // Load latest up to 5 calls (tenant-scoped)
   // -------------------------
   Future<void> _loadLatestCalls() async {
     setState(() {
@@ -341,7 +356,11 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
         return;
       }
 
+      final tenantId = await _getTenantIdFromPrefs();
+
       final q = await FirebaseFirestore.instance
+          .collection('tenants')
+          .doc(tenantId)
           .collection('leads')
           .doc(_lead.id)
           .collection('calls')
@@ -374,7 +393,7 @@ class _LeadDetailsScreenState extends State<LeadDetailsScreen> {
     return '${diff.inDays}d';
   }
 
-  // Replaces the old callHistory UI — shows latest up to 5 calls from calls subcollection
+  // Replaces the old callHistory UI — shows latest up to 5 calls from tenant-scoped calls subcollection
   Widget _callHistorySection() {
     if (_loadingLatestCalls) {
       return const Padding(
