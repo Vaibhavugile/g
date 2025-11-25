@@ -5,17 +5,20 @@ import android.content.Context
 import android.content.Intent
 import android.util.Log
 import androidx.core.content.ContextCompat
+import androidx.work.Data
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
 import java.util.UUID
 
 class OutgoingReceiver : BroadcastReceiver() {
+
     private val TAG = "OutgoingReceiver"
 
     private val PREFS = "call_leads_prefs"
     private val KEY_LAST_OUTGOING = "last_outgoing_number"
     private val KEY_LAST_OUTGOING_TS = "last_outgoing_ts"
 
-    // Active/recency semantics (keep consistent with other components)
-    private val REUSE_WINDOW_MS = 120_000L            // 2 minutes fallback
+    private val REUSE_WINDOW_MS = 120_000L            // 2 minutes reuse window
     private val ACTIVE_CALL_TTL_MS = 60 * 60 * 1000L // 1 hour active TTL
 
     override fun onReceive(context: Context?, intent: Intent?) {
@@ -27,166 +30,141 @@ class OutgoingReceiver : BroadcastReceiver() {
         }
 
         val number = intent.getStringExtra(Intent.EXTRA_PHONE_NUMBER)
-
         if (number.isNullOrEmpty()) {
-            Log.w(TAG, "Outgoing Number empty/null. Ignoring.")
+            Log.w(TAG, "Outgoing number empty/null")
             return
         }
 
-        Log.d(TAG, "📞 Outgoing Number (raw): $number")
+        Log.d(TAG, "📞 Outgoing raw number: $number")
 
-        // normalize number to digits-only to keep canonical form across components
         val normalized = normalizeNumber(number)
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+        // Save outgoing marker
+        if (!normalized.isNullOrEmpty()) {
+            prefs.edit()
+                .putString(KEY_LAST_OUTGOING, normalized)
+                .putLong(KEY_LAST_OUTGOING_TS, System.currentTimeMillis())
+                .apply()
+
+            Log.d(TAG, "Saved outgoing marker: $normalized")
+        }
+
+        // Load tenantId + recording flag
+        val tenantId = prefs.getString("tenantId", null)
+        val recordingEnabled = prefs.getBoolean("recording_enabled", false)
+
+        if (tenantId != null) Log.d(TAG, "OutgoingReceiver: tenantId=$tenantId")
+        Log.d(TAG, "OutgoingReceiver: recordingEnabled=$recordingEnabled")
+
+        val lookupKey = normalized ?: number
+
+        // try to reuse active or recent callId
+        val existing = readActiveOrRecentCallId(context, lookupKey)
+        val callId = existing ?: ensureCallIdForPhone(context, lookupKey)
+
+        if (existing != null)
+            Log.d(TAG, "Reusing callId for outgoing: $lookupKey -> $existing")
+        else
+            Log.d(TAG, "Created new callId for outgoing: $lookupKey -> $callId")
+
+        val svcIntent = Intent(context, CallService::class.java).apply {
+            putExtra("event", "outgoing_start")
+            putExtra("direction", "outbound")
+            putExtra("phoneNumber", lookupKey)
+            putExtra("callId", callId)
+            putExtra("receivedAt", System.currentTimeMillis())
+            putExtra("recording_enabled", recordingEnabled)
+            tenantId?.let { putExtra("tenantId", it) }
+        }
+
+        // === TRY FOREGROUND START ===
         try {
-            val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            if (!normalized.isNullOrEmpty()) {
-                prefs.edit().putString(KEY_LAST_OUTGOING, normalized).putLong(KEY_LAST_OUTGOING_TS, System.currentTimeMillis()).apply()
-                Log.d(TAG, "Saved outgoing marker: $normalized")
-            } else {
-                Log.w(TAG, "Normalized outgoing number empty after cleanup. Using raw number instead.")
-            }
-
-            // Try to reuse existing callId if present for normalized (lookup-first)
-            val markerKey = if (!normalized.isNullOrEmpty()) normalized else number
-            val existing = readActiveOrRecentCallId(context, markerKey)
-            val callId = existing ?: ensureCallIdForPhone(context, markerKey)
-            if (existing != null) {
-                Log.d(TAG, "Reusing existing callId marker for $markerKey -> $existing")
-            } else {
-                Log.d(TAG, "Created new callId marker for $markerKey -> $callId")
-            }
-
-            // read tenantId from prefs and attach if present
-            val tenant = try {
-                prefs.getString("tenantId", null)
-            } catch (e: Exception) {
-                null
-            }
-            if (tenant == null) {
-                Log.d(TAG, "OutgoingReceiver: no tenantId in prefs (proceeding without tenant).")
-            } else {
-                Log.d(TAG, "OutgoingReceiver: attaching tenantId=$tenant to outgoing event.")
-            }
-
-            val serviceIntent = Intent(context, CallService::class.java).apply {
-                putExtra("direction", "outbound")
-                // prefer normalized if available, otherwise send raw
-                putExtra("phoneNumber", if (!normalized.isNullOrEmpty()) normalized else number)
-                putExtra("event", "outgoing_start")
-                putExtra("callId", callId)
-                putExtra("receivedAt", System.currentTimeMillis())
-                tenant?.let { putExtra("tenantId", it) }
-            }
-
-            try {
-                ContextCompat.startForegroundService(context, serviceIntent)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to start CallService for outgoing_start: ${e.localizedMessage}", e)
-            }
+            ContextCompat.startForegroundService(context, svcIntent)
+            return
         } catch (e: Exception) {
-            Log.e(TAG, "Error handling outgoing call: ${e.localizedMessage}", e)
+            Log.e(TAG, "startForegroundService failed (${e.localizedMessage}) — falling back to EnqueueEventWorker", e)
+        }
+
+        // === FALLBACK: WorkManager ===
+        try {
+            val builder = Data.Builder()
+            svcIntent.extras?.keySet()?.forEach { key ->
+                when (val v = svcIntent.extras?.get(key)) {
+                    is String -> builder.putString(key, v)
+                    is Long -> builder.putLong(key, v)
+                    is Int -> builder.putInt(key, v)
+                    is Boolean -> builder.putBoolean(key, v)
+                    else -> v?.toString()?.let { builder.putString(key, it) }
+                }
+            }
+
+            // ensure missing tenantId or recording flag are included
+            if (!builder.build().keyValueMap.containsKey("tenantId") && tenantId != null)
+                builder.putString("tenantId", tenantId)
+            if (!builder.build().keyValueMap.containsKey("recording_enabled"))
+                builder.putBoolean("recording_enabled", recordingEnabled)
+
+            // ensure timestamp
+            if (!builder.build().keyValueMap.containsKey("receivedAt"))
+                builder.putLong("receivedAt", System.currentTimeMillis())
+
+            val req = OneTimeWorkRequestBuilder<EnqueueEventWorker>()
+                .setInputData(builder.build())
+                .build()
+
+            WorkManager.getInstance(context).enqueue(req)
+            Log.d(TAG, "Outgoing event enqueued via WorkManager")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to enqueue fallback worker: ${e.localizedMessage}", e)
         }
     }
+
+    // ------------------ Helpers ------------------
 
     private fun normalizeNumber(n: String?): String? {
         if (n == null) return null
         val digits = n.filter { it.isDigit() }
-        return if (digits.isEmpty()) null else digits
+        return digits.ifEmpty { null }
     }
 
-    private fun generateCallId(): String {
-        return "call_" + UUID.randomUUID().toString().replace("-", "").take(12)
+    private fun generateCallId(): String =
+        "call_" + UUID.randomUUID().toString().replace("-", "").take(12)
+
+    private fun markCallActiveForPhone(ctx: Context, phone: String, callId: String) {
+        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val now = System.currentTimeMillis()
+        prefs.edit()
+            .putString("callid_$phone", callId)
+            .putLong("callid_ts_$phone", now)
+            .putLong("callid_active_until_$phone", now + ACTIVE_CALL_TTL_MS)
+            .putString("callid_to_phone_$callId", phone)
+            .apply()
     }
 
-    // -----------------------
-    // CallId lifecycle helpers (active & recent semantics)
-    // -----------------------
-    private fun markCallActiveForPhone(ctx: Context, phoneDigitsOrRaw: String, callId: String) {
-        try {
-            val normalized = normalizeNumber(phoneDigitsOrRaw) ?: phoneDigitsOrRaw
-            val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            val now = System.currentTimeMillis()
-            prefs.edit()
-                .putString("callid_$normalized", callId)
-                .putLong("callid_ts_$normalized", now)
-                .putLong("callid_active_until_$normalized", now + ACTIVE_CALL_TTL_MS)
-                .putString("callid_to_phone_$callId", normalized)
-                .apply()
-            Log.d(TAG, "Marked call active for $normalized -> $callId until ${now + ACTIVE_CALL_TTL_MS}")
-        } catch (e: Exception) {
-            Log.w(TAG, "markCallActiveForPhone failed: ${e.localizedMessage}")
-        }
+    private fun readActiveOrRecentCallId(ctx: Context, phoneRaw: String): String? {
+        val phone = normalizeNumber(phoneRaw) ?: phoneRaw
+        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val id = prefs.getString("callid_$phone", null) ?: return null
+        val now = System.currentTimeMillis()
+
+        val activeUntil = prefs.getLong("callid_active_until_$phone", 0L)
+        if (activeUntil > now) return id
+
+        val ts = prefs.getLong("callid_ts_$phone", 0L)
+        if (ts != 0L && (now - ts) <= REUSE_WINDOW_MS) return id
+
+        return null
     }
 
-    private fun readActiveOrRecentCallId(ctx: Context, phoneDigitsOrRaw: String): String? {
-        try {
-            val normalized = normalizeNumber(phoneDigitsOrRaw) ?: phoneDigitsOrRaw
-            val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            val id = prefs.getString("callid_$normalized", null) ?: return null
-            val now = System.currentTimeMillis()
+    private fun ensureCallIdForPhone(ctx: Context, phoneRaw: String): String {
+        val phone = normalizeNumber(phoneRaw) ?: phoneRaw
+        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val existing = prefs.getString("callid_$phone", null)
+        if (!existing.isNullOrEmpty()) return existing
 
-            // check explicit active-until marker first
-            val activeUntil = prefs.getLong("callid_active_until_$normalized", 0L)
-            if (activeUntil > now) {
-                Log.d(TAG, "Reusing ACTIVE callId for $normalized -> $id (activeUntil=$activeUntil)")
-                return id
-            }
-
-            // fallback: allow short reuse window if active marker expired but ts is recent
-            val ts = prefs.getLong("callid_ts_$normalized", 0L)
-            if (ts != 0L && (now - ts) <= REUSE_WINDOW_MS) {
-                Log.d(TAG, "Reusing RECENT callId for $normalized -> $id (ts=$ts)")
-                return id
-            }
-
-            // too old / not active
-            return null
-        } catch (e: Exception) {
-            Log.w(TAG, "readActiveOrRecentCallId failed: ${e.localizedMessage}")
-            return null
-        }
-    }
-
-    private fun clearCallIdMapping(ctx: Context, phoneDigitsOrRaw: String) {
-        try {
-            val normalized = normalizeNumber(phoneDigitsOrRaw) ?: phoneDigitsOrRaw
-            val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            prefs.edit()
-                .remove("callid_$normalized")
-                .remove("callid_ts_$normalized")
-                .remove("callid_active_until_$normalized")
-                .apply()
-            Log.d(TAG, "Cleared callId mapping for $normalized")
-        } catch (e: Exception) {
-            Log.w(TAG, "clearCallIdMapping failed: ${e.localizedMessage}")
-        }
-    }
-
-    /**
-     * Backward-compatible ensure: returns existing mapping if present, otherwise creates a new callId
-     * and marks it active (writes timestamp, active-until and reverse mapping).
-     */
-    private fun ensureCallIdForPhone(ctx: Context, phoneDigitsOrRaw: String): String {
-        try {
-            val normalized = normalizeNumber(phoneDigitsOrRaw) ?: phoneDigitsOrRaw
-            if (normalized.isNullOrEmpty()) return generateCallId()
-            val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            val existing = prefs.getString("callid_$normalized", null)
-            if (!existing.isNullOrEmpty()) {
-                // backfill timestamp if missing
-                val ts = prefs.getLong("callid_ts_$normalized", 0L)
-                if (ts == 0L) prefs.edit().putLong("callid_ts_$normalized", System.currentTimeMillis()).apply()
-                return existing
-            }
-
-            val newId = generateCallId()
-            markCallActiveForPhone(ctx, normalized, newId)
-            Log.d(TAG, "ensureCallIdForPhone created and marked active: $normalized -> $newId")
-            return newId
-        } catch (e: Exception) {
-            Log.w(TAG, "ensureCallIdForPhone failed: ${e.localizedMessage}")
-        }
-        // fallback
-        return generateCallId()
+        val newId = generateCallId()
+        markCallActiveForPhone(ctx, phone, newId)
+        return newId
     }
 }

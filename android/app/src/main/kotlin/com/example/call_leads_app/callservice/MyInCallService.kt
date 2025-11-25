@@ -13,7 +13,7 @@ class MyInCallService : InCallService() {
     private val TAG = "MyInCallService"
     private val PREFS = "call_leads_prefs"
 
-    // Active/recency semantics (keep in sync with CallService)
+    // Active/recency semantics
     private val REUSE_WINDOW_MS = 120_000L            // 2 minutes fallback
     private val ACTIVE_CALL_TTL_MS = 60 * 60 * 1000L // 1 hour active TTL
 
@@ -32,35 +32,30 @@ class MyInCallService : InCallService() {
     override fun onCallAdded(call: Call) {
         super.onCallAdded(call)
         Log.d(TAG, "onCallAdded: ${call.details?.handle}")
+
         try {
             call.registerCallback(callCallback)
         } catch (e: Exception) {
-            Log.e(TAG, "Error registering call callback: ${e.localizedMessage}", e)
+            Log.e(TAG, "Error registering callback: ${e.localizedMessage}", e)
         }
 
-        // Best-effort: try to forward an initial event to CallService with a callId
         try {
             val handle = call.details?.handle
             val phone = handle?.schemeSpecificPart
             val normalized = normalizeNumber(phone) ?: phone
 
-            // Try to reuse existing mapping (active/recent), otherwise create one and mark active
             val existing = normalized?.let { readActiveOrRecentCallId(applicationContext, it) }
             val callId = existing ?: ensureCallIdForPhone(applicationContext, normalized ?: phone)
 
             if (existing != null) {
-                Log.d(TAG, "Reusing existing callId marker from InCallService for ${normalized ?: phone} -> $existing")
+                Log.d(TAG, "Reusing existing callId for inbound ring: $normalized -> $existing")
             } else {
-                Log.d(TAG, "Persisted callId marker from InCallService for ${normalized ?: phone} -> $callId")
+                Log.d(TAG, "Created new callId for inbound ring: $normalized -> $callId")
             }
 
-            // read tenantId from prefs (if present) and attach to intent
-            val tenant = try {
-                applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("tenantId", null)
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed reading tenantId from prefs: ${e.localizedMessage}")
-                null
-            }
+            val prefs = applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val tenant = prefs.getString("tenantId", null)
+            val recordingEnabled = prefs.getBoolean("recording_enabled", false)
 
             val intent = Intent(applicationContext, CallService::class.java).apply {
                 putExtra("event", "ringing")
@@ -68,82 +63,79 @@ class MyInCallService : InCallService() {
                 putExtra("phoneNumber", normalized ?: phone)
                 putExtra("callId", callId)
                 putExtra("receivedAt", System.currentTimeMillis())
+                putExtra("recording_enabled", recordingEnabled)
                 tenant?.let { putExtra("tenantId", it) }
             }
-            // try start service (defensive - may fail in some contexts)
+
             try {
                 ContextCompat.startForegroundService(applicationContext, intent)
-            } catch (ex: Exception) {
-                // ignore; On many OEMs InCallService may run in a context that can't start foreground services.
-                Log.w(TAG, "Couldn't start CallService from InCallService: ${ex.localizedMessage}")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to start CallService from InCallService: ${e.localizedMessage}")
             }
+
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to forward callAdded to CallService: ${e.localizedMessage}")
+            Log.w(TAG, "Failed to handle onCallAdded: ${e.localizedMessage}")
         }
     }
 
     override fun onCallRemoved(call: Call) {
         super.onCallRemoved(call)
         Log.d(TAG, "onCallRemoved: ${call.details?.handle}")
+
         try {
             call.unregisterCallback(callCallback)
-        } catch (ignored: Exception) {
-            // defensive: ignore
-        }
+        } catch (_: Exception) {}
 
-        // Best-effort: forward final/ended to CallService with callId if possible
         try {
             val handle = call.details?.handle
             val phone = handle?.schemeSpecificPart
             val normalized = normalizeNumber(phone) ?: phone
 
-            val existing = if (!normalized.isNullOrEmpty()) readActiveOrRecentCallId(applicationContext, normalized) else null
+            val existing = if (!normalized.isNullOrEmpty())
+                readActiveOrRecentCallId(applicationContext, normalized)
+            else null
+
             val callId = existing ?: ensureCallIdForPhone(applicationContext, normalized ?: phone)
 
             if (existing != null) {
-                Log.d(TAG, "Reusing existing callId marker on callRemoved for ${normalized ?: phone} -> $existing")
+                Log.d(TAG, "Reusing existing callId for ended inbound call: $normalized -> $existing")
             } else {
-                Log.d(TAG, "Created callId marker on callRemoved for ${normalized ?: phone} -> $callId")
+                Log.d(TAG, "Created callId for ended inbound call: $normalized -> $callId")
             }
 
-            // ensure reverse mapping exists for callId (markCallActiveForPhone already does this when creating)
+            // Ensure reverse phone mapping is saved
             if (!callId.isNullOrEmpty() && !normalized.isNullOrEmpty()) {
                 try {
                     val prefs = applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                     prefs.edit().putString("callid_to_phone_$callId", normalized).apply()
                 } catch (e: Exception) {
-                    Log.w(TAG, "Failed to ensure reverse mapping on callRemoved: ${e.localizedMessage}")
+                    Log.w(TAG, "Failed reverse mapping on callRemoved: ${e.localizedMessage}")
                 }
             }
 
-            // read tenantId from prefs (if present) and attach to intent
-            val tenant = try {
-                applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("tenantId", null)
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed reading tenantId from prefs: ${e.localizedMessage}")
-                null
-            }
+            val prefs = applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val tenant = prefs.getString("tenantId", null)
+            val recordingEnabled = prefs.getBoolean("recording_enabled", false)
 
             val intent = Intent(applicationContext, CallService::class.java).apply {
                 putExtra("event", "ended")
                 putExtra("direction", "inbound")
                 putExtra("phoneNumber", normalized ?: phone)
-                if (!callId.isNullOrEmpty()) putExtra("callId", callId)
+                putExtra("callId", callId)
                 putExtra("receivedAt", System.currentTimeMillis())
+                putExtra("recording_enabled", recordingEnabled)
                 tenant?.let { putExtra("tenantId", it) }
             }
+
             try {
                 ContextCompat.startForegroundService(applicationContext, intent)
-            } catch (ex: Exception) {
-                Log.w(TAG, "Couldn't start CallService for ended event: ${ex.localizedMessage}")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to start CallService for ended: ${e.localizedMessage}")
             }
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to forward callRemoved to CallService: ${e.localizedMessage}")
-        }
-    }
 
-    private fun generateCallId(): String {
-        return "call_" + UUID.randomUUID().toString().replace("-", "").take(12)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to handle onCallRemoved: ${e.localizedMessage}")
+        }
     }
 
     private fun normalizeNumber(n: String?): String? {
@@ -152,67 +144,55 @@ class MyInCallService : InCallService() {
         return if (digits.isEmpty()) null else digits
     }
 
-    // -----------------------
-    // CallId lifecycle helpers (active & recent semantics)
-    // -----------------------
-    private fun markCallActiveForPhone(ctx: Context, phoneDigitsOrRaw: String, callId: String) {
+    private fun generateCallId(): String =
+        "call_" + UUID.randomUUID().toString().replace("-", "").take(12)
+
+    private fun ensureCallIdForPhone(ctx: Context, phone: String?): String {
         try {
-            val normalized = normalizeNumber(phoneDigitsOrRaw) ?: phoneDigitsOrRaw
+            val normalized = normalizeNumber(phone) ?: phone ?: return generateCallId()
+            val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+            prefs.getString("callid_$normalized", null)?.let { return it }
+
+            val newId = generateCallId()
+            markCallActiveForPhone(ctx, normalized, newId)
+            return newId
+        } catch (_: Exception) {}
+        return generateCallId()
+    }
+
+    private fun readActiveOrRecentCallId(ctx: Context, phoneRaw: String): String? {
+        return try {
+            val normalized = normalizeNumber(phoneRaw) ?: phoneRaw
+            val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val id = prefs.getString("callid_$normalized", null) ?: return null
+            val now = System.currentTimeMillis()
+
+            val activeUntil = prefs.getLong("callid_active_until_$normalized", 0L)
+            if (activeUntil > now) return id
+
+            val ts = prefs.getLong("callid_ts_$normalized", 0L)
+            if (ts != 0L && (now - ts) <= REUSE_WINDOW_MS) return id
+
+            null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun markCallActiveForPhone(ctx: Context, phone: String, callId: String) {
+        try {
+            val normalized = normalizeNumber(phone) ?: phone
             val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             val now = System.currentTimeMillis()
+
             prefs.edit()
                 .putString("callid_$normalized", callId)
                 .putLong("callid_ts_$normalized", now)
                 .putLong("callid_active_until_$normalized", now + ACTIVE_CALL_TTL_MS)
                 .putString("callid_to_phone_$callId", normalized)
                 .apply()
-            Log.d(TAG, "Marked call active for $normalized -> $callId until ${now + ACTIVE_CALL_TTL_MS}")
-        } catch (e: Exception) {
-            Log.w(TAG, "markCallActiveForPhone failed: ${e.localizedMessage}")
-        }
-    }
 
-    private fun readActiveOrRecentCallId(ctx: Context, phoneDigitsOrRaw: String): String? {
-        try {
-            val normalized = normalizeNumber(phoneDigitsOrRaw) ?: phoneDigitsOrRaw
-            val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            val id = prefs.getString("callid_$normalized", null) ?: return null
-            val now = System.currentTimeMillis()
-
-            val activeUntil = prefs.getLong("callid_active_until_$normalized", 0L)
-            if (activeUntil > now) {
-                Log.d(TAG, "Reusing ACTIVE callId for $normalized -> $id (activeUntil=$activeUntil)")
-                return id
-            }
-
-            val ts = prefs.getLong("callid_ts_$normalized", 0L)
-            if (ts != 0L && (now - ts) <= REUSE_WINDOW_MS) {
-                Log.d(TAG, "Reusing RECENT callId for $normalized -> $id (ts=$ts)")
-                return id
-            }
-
-            return null
-        } catch (e: Exception) {
-            Log.w(TAG, "readActiveOrRecentCallId failed: ${e.localizedMessage}")
-            return null
-        }
-    }
-
-    private fun ensureCallIdForPhone(ctx: Context, phoneDigitsOrRaw: String?): String {
-        try {
-            val normalized = normalizeNumber(phoneDigitsOrRaw) ?: phoneDigitsOrRaw ?: return generateCallId()
-            val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            val existing = prefs.getString("callid_$normalized", null)
-            if (!existing.isNullOrEmpty()) return existing
-
-            val newId = generateCallId()
-            // mark active and persist
-            markCallActiveForPhone(ctx, normalized, newId)
-            Log.d(TAG, "ensureCallIdForPhone created and marked active: $normalized -> $newId")
-            return newId
-        } catch (e: Exception) {
-            Log.w(TAG, "ensureCallIdForPhone failed: ${e.localizedMessage}")
-        }
-        return generateCallId()
+        } catch (_: Exception) {}
     }
 }

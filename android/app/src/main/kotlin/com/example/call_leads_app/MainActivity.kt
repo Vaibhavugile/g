@@ -21,6 +21,8 @@ class MainActivity : FlutterActivity() {
     private val OPEN_LEAD_CHANNEL = "com.example.call_leads_app/openLead"
     private val TAG = "MainActivity"
     private val REQUEST_ROLE_DIALER = 32123
+    private val PREFS = "call_leads_prefs"
+    private val KEY_DIALER_PROMPTED = "dialer_role_prompted_v1"
 
     // MethodChannel used to forward "openLeadByPhone" calls into Flutter
     private var openLeadMethodChannel: MethodChannel? = null
@@ -131,6 +133,15 @@ class MainActivity : FlutterActivity() {
 
         // If the activity was launched with extras, forward them to Flutter
         handleIntentForOpenLead(intent)
+
+        // Small delay to allow engine to finish warm-up; then prompt for dialer role once
+        Handler(Looper.getMainLooper()).postDelayed({
+            try {
+                ensurePromptForDialerRoleIfNeeded()
+            } catch (e: Exception) {
+                Log.w(TAG, "ensurePromptForDialerRoleIfNeeded failed: ${e.localizedMessage}")
+            }
+        }, 600)
     }
 
     /**
@@ -167,6 +178,44 @@ class MainActivity : FlutterActivity() {
     // -------------------
     // REQUEST ROLE DIALER
     // -------------------
+    private fun ensurePromptForDialerRoleIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            Log.d(TAG, "ensurePromptForDialerRoleIfNeeded: API < 29, skipping.")
+            return
+        }
+
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val alreadyPrompted = prefs.getBoolean(KEY_DIALER_PROMPTED, false)
+        if (alreadyPrompted) {
+            Log.d(TAG, "Dialer role already prompted previously (skip).")
+            return
+        }
+
+        // Only prompt when activity is in foreground (safety)
+        if (!isFinishing && !isChangingConfigurations) {
+            val roleManager = getSystemService(Context.ROLE_SERVICE) as? RoleManager
+            if (roleManager != null && !roleManager.isRoleHeld(RoleManager.ROLE_DIALER)) {
+                // Mark that we prompted so we don't spam the user repeatedly
+                prefs.edit().putBoolean(KEY_DIALER_PROMPTED, true).apply()
+
+                try {
+                    val intent = roleManager.createRequestRoleIntent(RoleManager.ROLE_DIALER)
+                    startActivityForResult(intent, REQUEST_ROLE_DIALER)
+                    Log.d(TAG, "Launched system role request for DIALER (user will see dialog).")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to launch role request intent: ${e.localizedMessage}", e)
+                }
+            } else {
+                Log.d(TAG, "RoleManager null or role already held; not prompting.")
+            }
+        } else {
+            Log.d(TAG, "Activity not in foreground; skipping dialer prompt.")
+        }
+    }
+
+    /**
+     * Exposed method to programmatically request the dialer role from Flutter
+     */
     private fun requestDialerRole(): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             Log.w(TAG, "ROLE_DIALER requires API 29+. Skipped.")

@@ -19,6 +19,9 @@ import org.json.JSONObject
  *  - removeOldEntriesOlderThan: allow garbage-collection of stale head items (by receivedAt).
  *  - MAX_QUEUE_SIZE to prevent unbounded growth (defensive).
  *  - getRawJson / dumpToLog for debugging.
+ *  - popFirstN: atomically remove-and-return first N items (helps workers process + remove in one step).
+ *  - findIndicesWithRecording: quick scan for queued items that include a local recordingPath.
+ *  - removeEntriesByIndices: remove arbitrary indices (useful to delete items after partial success).
  */
 class EventQueue(private val ctx: Context) {
 
@@ -144,6 +147,38 @@ class EventQueue(private val ctx: Context) {
     }
 
     /**
+     * Atomically remove and return first N events. Returns list (possibly smaller than N).
+     * This is useful for workers that want to process-and-delete as one operation.
+     */
+    fun popFirstN(n: Int): List<Map<String, Any?>> {
+        if (n <= 0) return emptyList()
+        synchronized(lock) {
+            val arr = loadArray()
+            val out = mutableListOf<Map<String, Any?>>()
+            val remaining = JSONArray()
+
+            for (i in 0 until arr.length()) {
+                if (i < n) {
+                    val jo = arr.optJSONObject(i) ?: continue
+                    val map = mutableMapOf<String, Any?>()
+                    val keys = jo.keys()
+                    while (keys.hasNext()) {
+                        val key = keys.next()
+                        val value = jo.opt(key)
+                        map[key] = if (value === JSONObject.NULL) null else value
+                    }
+                    out.add(map)
+                } else {
+                    remaining.put(arr.get(i))
+                }
+            }
+
+            saveArray(remaining)
+            return out
+        }
+    }
+
+    /**
      * Remove first N events (after successful processing).
      */
     fun removeFirstN(n: Int) {
@@ -158,6 +193,44 @@ class EventQueue(private val ctx: Context) {
             }
 
             saveArray(newArr)
+        }
+    }
+
+    /**
+     * Remove entries at arbitrary indices (non-contiguous). Indices refer to the current
+     * queue ordering (0-based). This is useful when some items in the queue were processed
+     * successfully while others failed and should be retained.
+     */
+    fun removeEntriesByIndices(indices: List<Int>) {
+        if (indices.isEmpty()) return
+        synchronized(lock) {
+            val toRemove = indices.toSet()
+            val arr = loadArray()
+            val newArr = JSONArray()
+            for (i in 0 until arr.length()) {
+                if (toRemove.contains(i)) continue
+                newArr.put(arr.get(i))
+            }
+            saveArray(newArr)
+        }
+    }
+
+    /**
+     * Scan queue and return list of indices that contain a local recordingPath entry.
+     * The returned indices are in ascending order and refer to current queue ordering.
+     */
+    fun findIndicesWithRecording(): List<Int> {
+        synchronized(lock) {
+            val arr = loadArray()
+            val results = mutableListOf<Int>()
+            for (i in 0 until arr.length()) {
+                val jo = arr.optJSONObject(i) ?: continue
+                if (jo.has("recordingPath")) {
+                    val v = jo.optString("recordingPath", "")
+                    if (v.isNotEmpty()) results.add(i)
+                }
+            }
+            return results
         }
     }
 
@@ -262,7 +335,8 @@ class EventQueue(private val ctx: Context) {
                         val phone = jo.optString("phoneNumber", "<no-phone>")
                         val tenant = jo.optString("tenantId", "<no-tenant>")
                         val received = jo.opt("receivedAt") ?: "<no-ts>"
-                        Log.d(TAG, "  [$i] phone=$phone tenant=$tenant received=$received")
+                        val hasRec = if (jo.has("recordingPath") && jo.optString("recordingPath", "").isNotEmpty()) "[rec]" else ""
+                        Log.d(TAG, "  [$i] phone=$phone tenant=$tenant received=$received $hasRec")
                     } catch (e: Exception) {
                         Log.d(TAG, "  [$i] (error reading item): ${e.localizedMessage}")
                     }

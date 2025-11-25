@@ -16,12 +16,15 @@ import com.google.firebase.auth.FirebaseAuthException
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.SetOptions
+import com.google.firebase.storage.FirebaseStorage
 import kotlinx.coroutines.tasks.await
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
 import kotlin.random.Random
 import com.google.firebase.firestore.Query
+import android.net.Uri
+import java.io.File
 
 /**
  * UploadWorker: reads queued events from EventQueue, and writes them into Firestore using the
@@ -29,12 +32,13 @@ import com.google.firebase.firestore.Query
  *
  * /tenants/{tenantId}/leads/{leadId}/calls/{callId}/events/{eventId}
  *
- * This variant is defensive:
- *  - Builds ops only for items that have a usable phone number (tries to recover using callId).
- *  - Commits in conservative chunks (well under Firestore limits).
- *  - Removes only the contiguous prefix of queued items that were actually uploaded,
- *    preventing accidental deletion of later items when some early items were skipped.
- *  - If an item lacks tenantId, routes it to `tenants/default_tenant/review/queued_items` and marks it.
+ * Additionally, when a queued item includes a local `recordingPath`, this worker will attempt
+ * to upload the file to Firebase Storage and create a recordings doc under the call:
+ *
+ * /tenants/{tenantId}/leads/{leadId}/calls/{callId}/recordings/{recordingId}
+ *
+ * The worker is defensive: failures to upload recordings won't block the rest of the batch; the
+ * recording upload is attempted per-item and logged.
  */
 class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWorker(appContext, params) {
 
@@ -102,7 +106,8 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                 val callPath: String,
                 val callBase: Map<String, Any?>,
                 val eventData: Map<String, Any?>,
-                val finalizeFields: Map<String, Any?>?
+                val finalizeFields: Map<String, Any?>?,
+                val recordingPath: String?
             )
 
             val ops = mutableListOf<IndexedOp>()
@@ -220,6 +225,8 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                         eventData["needsTenantReview"] = true
                     }
 
+                    val recordingPath = (item["recordingPath"] as? String)
+
                     val isFinal = (outcome == "ended" || duration != null)
                     val finalizeFields = if (isFinal) {
                         val ff = mutableMapOf<String, Any?>( //
@@ -239,7 +246,8 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                             callPath = callRefPath,
                             callBase = callBase,
                             eventData = eventData,
-                            finalizeFields = finalizeFields
+                            finalizeFields = finalizeFields,
+                            recordingPath = recordingPath
                         )
                     )
                 } catch (e: Exception) {
@@ -268,6 +276,57 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                         val leadRef = firestore.document(op.leadPath)
                         val callRef = firestore.document(op.callPath)
                         val eventRef = firestore.collection(op.callPath + "/events").document() // create a fresh doc
+                        // If there is a recordingPath for this op, try to upload it to Firebase Storage and
+                        // write a recordings subdoc under the call. We upload *before* the batch commit so the
+                        // recording URL can be included in the same logical upload if desired.
+                        val recordingLocalPath = op.recordingPath
+                        if (!recordingLocalPath.isNullOrEmpty()) {
+                            try {
+                                val localFile = File(recordingLocalPath)
+                                if (localFile.exists()) {
+                                    val storage = FirebaseStorage.getInstance()
+                                    val leadId = op.leadPath.substringAfter("leads/").substringBefore("/calls")
+                                    val callId = op.callPath.substringAfterLast("/")
+                                    val remotePath = "tenants/${op.tenantId}/leads/$leadId/calls/$callId/recordings/${localFile.name}"
+                                    val uploadRef = storage.reference.child(remotePath)
+                                    Log.d(TAG, "Uploading recording for opIdx=${op.originalIndex} -> $remotePath")
+                                    try {
+                                        uploadRef.putFile(Uri.fromFile(localFile)).await()
+                                        val downloadUrl = uploadRef.downloadUrl.await().toString()
+
+                                        // create recording metadata doc
+                                        val recMeta = mapOf(
+                                            "path" to remotePath,
+                                            "url" to downloadUrl,
+                                            "size" to localFile.length(),
+                                            "uploadedAt" to FieldValue.serverTimestamp(),
+                                            "callId" to callId
+                                        )
+                                        val recDoc = firestore.collection(op.callPath + "/recordings").document()
+                                        batch.set(recDoc, recMeta)
+
+                                        // also merge lastRecordingUrl into call doc for easy access
+                                        batch.set(callRef, mapOf("lastRecordingUrl" to downloadUrl), SetOptions.merge())
+
+                                        Log.d(TAG, "Uploaded recording and queued recording doc for opIdx=${op.originalIndex}")
+
+                                        // delete local file after scheduling upload doc (optional)
+                                        try {
+                                            localFile.delete()
+                                        } catch (e: Exception) {
+                                            Log.w(TAG, "Failed to delete local recording file after upload: ${e.localizedMessage}")
+                                        }
+                                    } catch (e: Exception) {
+                                        Log.w(TAG, "Recording upload failed for opIdx=${op.originalIndex}: ${e.localizedMessage}")
+                                    }
+                                } else {
+                                    Log.w(TAG, "Recording file not found for opIdx=${op.originalIndex}: $recordingLocalPath")
+                                }
+                            } catch (e: Exception) {
+                                Log.w(TAG, "Error while processing recording upload for opIdx=${op.originalIndex}: ${e.localizedMessage}")
+                            }
+                        }
+
                         batch.set(leadRef, op.leadData, SetOptions.merge())
                         batch.set(callRef, op.callBase, SetOptions.merge())
                         batch.set(eventRef, op.eventData)

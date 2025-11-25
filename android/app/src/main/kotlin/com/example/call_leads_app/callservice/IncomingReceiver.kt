@@ -57,6 +57,9 @@ class IncomingReceiver : BroadcastReceiver() {
                 null
             }
 
+            // read recording flag and attach to intents so workers/services see it immediately
+            val recordingEnabled = try { prefs.getBoolean("recording_enabled", false) } catch (e: Exception) { false }
+
             if (isRecentOutgoing && normalizedIncoming != null) {
                 if (numbersLikelyMatch(lastOutgoing, normalizedIncoming)) {
                     Log.d(TAG, "ℹ️ Detected recent outgoing marker for $normalizedIncoming — treating as outbound and clearing marker.")
@@ -75,6 +78,7 @@ class IncomingReceiver : BroadcastReceiver() {
                         putExtra("phoneNumber", normalizedIncoming)
                         putExtra("callId", callId)
                         putExtra("receivedAt", now)
+                        putExtra("recording_enabled", recordingEnabled)
                         // attach tenant if present
                         tenantId?.let { putExtra("tenantId", it) }
                     }
@@ -98,6 +102,7 @@ class IncomingReceiver : BroadcastReceiver() {
                             putExtra("phoneNumber", normalizedIncoming)
                             putExtra("callId", callId)
                             putExtra("receivedAt", now)
+                            putExtra("recording_enabled", recordingEnabled)
                             tenantId?.let { putExtra("tenantId", it) }
                         }
                         safeStartServiceOrEnqueue(context, i, normalizedIncoming)
@@ -117,7 +122,6 @@ class IncomingReceiver : BroadcastReceiver() {
                     try {
                         val markerPhone = normalizedIncoming ?: incomingNumber
                         if (!markerPhone.isNullOrEmpty() && !callId.isNullOrEmpty()) {
-                            // ensure reverse mapping exists
                             val prefsLocal = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                             prefsLocal.edit().putString("callid_to_phone_$callId", markerPhone).apply()
                         }
@@ -131,6 +135,7 @@ class IncomingReceiver : BroadcastReceiver() {
                         putExtra("phoneNumber", normalizedIncoming)
                         putExtra("callId", callId)
                         putExtra("receivedAt", now)
+                        putExtra("recording_enabled", recordingEnabled)
                         tenantId?.let { putExtra("tenantId", it) }
                     }
                     safeStartServiceOrEnqueue(context, i, normalizedIncoming)
@@ -154,6 +159,7 @@ class IncomingReceiver : BroadcastReceiver() {
                         putExtra("phoneNumber", normalizedIncoming)
                         putExtra("callId", callId)
                         putExtra("receivedAt", now)
+                        putExtra("recording_enabled", recordingEnabled)
                         tenantId?.let { putExtra("tenantId", it) }
                     }
                     safeStartServiceOrEnqueue(context, i, normalizedIncoming)
@@ -194,8 +200,11 @@ class IncomingReceiver : BroadcastReceiver() {
                     dataBuilder.putString("tenantId", tenant)
                     Log.d(TAG, "Added tenantId to Worker input: $tenant")
                 }
+                // also include current recording_enabled flag so worker knows intent context
+                val rec = prefs.getBoolean("recording_enabled", false)
+                if (!dataBuilder.build().keyValueMap.containsKey("recording_enabled")) dataBuilder.putBoolean("recording_enabled", rec)
             } catch (e: Exception) {
-                Log.w(TAG, "Error while adding tenantId to worker input: ${e.localizedMessage}")
+                Log.w(TAG, "Error while adding tenantId/rec flag to worker input: ${e.localizedMessage}")
             }
 
             if (!svcIntent.hasExtra("receivedAt")) {
@@ -207,8 +216,27 @@ class IncomingReceiver : BroadcastReceiver() {
                 .build()
             WorkManager.getInstance(context).enqueue(work)
 
-            // post a notification so user can tap to open the app (and we will pass lead id when available)
-            postTapNotification(context, normalizedPhone)
+            // Optionally post a notification so users and OEMs know we deferred to a worker
+            try {
+                val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    var ch = nm.getNotificationChannel(NOTIF_CHANNEL_ID)
+                    if (ch == null) {
+                        ch = NotificationChannel(NOTIF_CHANNEL_ID, "Call Lead Events", NotificationManager.IMPORTANCE_LOW)
+                        nm.createNotificationChannel(ch)
+                    }
+                }
+
+                val n = NotificationCompat.Builder(context, NOTIF_CHANNEL_ID)
+                    .setContentTitle("Call event queued")
+                    .setContentText("Recording will be attached when available")
+                    .setSmallIcon(android.R.drawable.stat_sys_download)
+                    .setAutoCancel(true)
+                    .build()
+                nm.notify(NOTIF_ID_LEAD, n)
+            } catch (e: Exception) {
+                // ignore notification failures
+            }
         }
     }
 

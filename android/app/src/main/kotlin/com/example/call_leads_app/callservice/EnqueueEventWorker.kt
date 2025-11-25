@@ -33,6 +33,18 @@ class EnqueueEventWorker(appContext: Context, workerParams: WorkerParameters) : 
             }
             // --- end tenant preservation ---
 
+            // --- NEW: ensure recordingEnabled flag preserved (if passed via extras) ---
+            try {
+                if (data.keyValueMap.containsKey("recording_enabled")) {
+                    val rec = try { data.getBoolean("recording_enabled", false) } catch (_: Exception) { false }
+                    eventMap["recording_enabled"] = rec
+                    Log.d(TAG, "Preserved recording_enabled=$rec from inputData")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Error preserving recording_enabled: ${e.localizedMessage}")
+            }
+            // --- end recording flag preservation ---
+
             // Normalize phoneNumber if present (digits-only)
             val phoneRaw = eventMap["phoneNumber"] as? String
             val normalized = phoneRaw?.filter { it.isDigit() }

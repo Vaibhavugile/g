@@ -48,12 +48,9 @@ class MyCallRedirectionService : CallRedirectionService() {
                 Log.d(TAG, "Saved callId marker for $normalized -> $callId (and reverse mapping)")
             }
 
-            // read tenant and attach if present
-            val tenant = try {
-                prefs.getString("tenantId", null)
-            } catch (e: Exception) {
-                null
-            }
+            // read tenant and recording flag and attach if present
+            val tenant = try { prefs.getString("tenantId", null) } catch (e: Exception) { null }
+            val recordingEnabled = try { prefs.getBoolean("recording_enabled", false) } catch (e: Exception) { false }
 
             val intent = Intent().apply {
                 setClassName(packageName, CALL_SERVICE_CLASS_NAME)
@@ -62,11 +59,37 @@ class MyCallRedirectionService : CallRedirectionService() {
                 putExtra("phoneNumber", normalized)
                 putExtra("callId", callId)
                 putExtra("receivedAt", System.currentTimeMillis())
+                putExtra("recording_enabled", recordingEnabled)
                 tenant?.let { putExtra("tenantId", it) }
             }
 
-            Log.d(TAG, "Starting CallService for outgoing_start with callId=$callId and tenant=$tenant")
-            ContextCompat.startForegroundService(this, intent)
+            Log.d(TAG, "Starting CallService for outgoing_start with callId=$callId tenant=$tenant recordingEnabled=$recordingEnabled")
+            try {
+                ContextCompat.startForegroundService(this, intent)
+            } catch (e: Exception) {
+                Log.w(TAG, "startForegroundService failed in CallRedirectionService: ${e.localizedMessage}")
+                // best-effort: fall back to enqueuing via WorkManager if starting service fails
+                try {
+                    val dataBuilder = androidx.work.Data.Builder()
+                    intent.extras?.keySet()?.forEach { key ->
+                        val v = intent.extras?.get(key)
+                        when (v) {
+                            is String -> dataBuilder.putString(key, v)
+                            is Long -> dataBuilder.putLong(key, v)
+                            is Int -> dataBuilder.putInt(key, v)
+                            is Boolean -> dataBuilder.putBoolean(key, v)
+                            else -> v?.toString()?.let { dataBuilder.putString(key, it) }
+                        }
+                    }
+                    val req = androidx.work.OneTimeWorkRequestBuilder<EnqueueEventWorker>()
+                        .setInputData(dataBuilder.build())
+                        .build()
+                    androidx.work.WorkManager.getInstance(this).enqueue(req)
+                    Log.d(TAG, "Enqueued outgoing_start via WorkManager as fallback")
+                } catch (ex: Exception) {
+                    Log.w(TAG, "Failed to enqueue fallback worker from CallRedirectionService: ${ex.localizedMessage}")
+                }
+            }
 
             placeCallUnmodified()
         } catch (e: Exception) {
