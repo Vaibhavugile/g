@@ -1,4 +1,5 @@
-// UPDATED main.dart with improved auth logging, tenant sync diagnostics, and permission checks.
+
+// UPDATED main.dart with improved auth logging & tenant sync diagnostics.
 
 import 'dart:async';
 import 'package:flutter/material.dart';
@@ -11,7 +12,6 @@ import 'call_event_handler.dart';
 import 'screens/home_screen.dart';
 import 'screens/login_screen.dart';
 import 'services/auth_service.dart';
-import 'services/permissions_service.dart';
 
 const MethodChannel _nativeChannel =
     MethodChannel('com.example.call_leads_app/native');
@@ -46,12 +46,15 @@ class MyApp extends StatefulWidget {
 
 class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
   final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
+  late final CallEventHandler _callHandler;
   StreamSubscription<User?>? _authSub;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+
+    _callHandler = CallEventHandler(navigatorKey: navigatorKey);
 
     // Monitor Firebase auth state
     _authSub =
@@ -69,32 +72,19 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
           print("⚠️ Tenant sync error: $e");
         }
 
-        // Request essential permissions (phone + microphone)
+        // start call handler
         try {
-          final ctx = navigatorKey.currentContext;
-          final ok = await PermissionsService.requestPermissions(context: ctx);
-          print('🔐 Permissions result: $ok');
+          Future.microtask(() => _callHandler.startListening());
         } catch (e) {
-          print('⚠️ Permissions request failed: $e');
-        }
-
-        // Ask native layer to flush any pending events to Flutter
-        try {
-          await _nativeChannel.invokeMethod('flushPendingEvents');
-          print('✅ Requested native flushPendingEvents');
-        } catch (e) {
-          print('⚠️ Native flushPendingEvents call failed: $e');
-        }
-
-        // Ask native layer to request RECORD_AUDIO at OS level if not already
-        try {
-          final granted = await _nativeChannel.invokeMethod<bool>('requestRecordAudioPermission');
-          print('🎙️ Native record-audio permission called; granted or requested: $granted');
-        } catch (e) {
-          print('⚠️ requestRecordAudioPermission failed: $e');
+          print("❌ Failed to start CallEventHandler: $e");
         }
       } else {
         print("⬅️ User signed out.");
+        try {
+          _callHandler.stopListening();
+        } catch (e) {
+          print("❌ Failed to stop CallEventHandler: $e");
+        }
       }
     });
   }
@@ -103,6 +93,7 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _authSub?.cancel();
+    _callHandler.dispose();
     super.dispose();
   }
 
@@ -112,12 +103,8 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
 
     if (state == AppLifecycleState.resumed) {
       if (FirebaseAuth.instance.currentUser != null) {
-        print("🔄 Resumed — requesting native flushPendingEvents.");
-        try {
-          _nativeChannel.invokeMethod('flushPendingEvents');
-        } catch (e) {
-          print('⚠️ flushPendingEvents on resume failed: $e');
-        }
+        print("🔄 Resumed — reattaching CallEventHandler.");
+        _callHandler.startListening();
       }
     }
   }

@@ -4,14 +4,11 @@ import android.app.Activity
 import android.app.role.RoleManager
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import androidx.annotation.NonNull
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -24,11 +21,9 @@ class MainActivity : FlutterActivity() {
     private val OPEN_LEAD_CHANNEL = "com.example.call_leads_app/openLead"
     private val TAG = "MainActivity"
     private val REQUEST_ROLE_DIALER = 32123
-    private val REQUEST_RECORD_AUDIO = 43219
 
     // MethodChannel used to forward "openLeadByPhone" calls into Flutter
     private var openLeadMethodChannel: MethodChannel? = null
-    private var nativeMethodChannel: MethodChannel? = null
 
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -69,12 +64,10 @@ class MainActivity : FlutterActivity() {
         // -------------------
         // METHOD CHANNEL SETUP (existing native channel)
         // -------------------
-        nativeMethodChannel = MethodChannel(
+        MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             NATIVE_CHANNEL
-        )
-
-        nativeMethodChannel?.setMethodCallHandler { call, result ->
+        ).setMethodCallHandler { call, result ->
 
             when (call.method) {
 
@@ -123,23 +116,6 @@ class MainActivity : FlutterActivity() {
                         result.success(true)
                     } catch (e: Exception) {
                         Log.e(TAG, "clearTenantId error: ${e.localizedMessage}", e)
-                        result.success(false)
-                    }
-                }
-
-                // NEW: request RECORD_AUDIO permission
-                "requestRecordAudioPermission" -> {
-                    try {
-                        val granted = ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-                        if (!granted) {
-                            ActivityCompat.requestPermissions(this, arrayOf(android.Manifest.permission.RECORD_AUDIO), REQUEST_RECORD_AUDIO)
-                            // We return false now to indicate permission was requested
-                            result.success(false)
-                        } else {
-                            result.success(true)
-                        }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "requestRecordAudioPermission error: ${e.localizedMessage}", e)
                         result.success(false)
                     }
                 }
@@ -222,20 +198,6 @@ class MainActivity : FlutterActivity() {
                 Log.d(TAG, "User granted default dialer role.")
             } else {
                 Log.d(TAG, "User rejected default dialer role.")
-            }
-        }
-    }
-
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQUEST_RECORD_AUDIO) {
-            val ok = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
-            Log.d(TAG, "RECORD_AUDIO permission result: $ok")
-            try {
-                // Notify Flutter about the permission result via the native channel
-                nativeMethodChannel?.invokeMethod("recordAudioPermissionResult", ok)
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to notify Flutter about record audio permission result: ${e.localizedMessage}")
             }
         }
     }
